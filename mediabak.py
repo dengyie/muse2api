@@ -3,7 +3,7 @@
 设计（对齐 MangoDrive 业务方接入指南）：
 - 生成完成的媒体文件 → 目录扫描 → OpenList REST `PUT /api/fs/put` 上传 →
   `fs/get` 回读 sha256 校验 → 校验一致才删本地；失败/不一致保留本地下轮重试。
-- 双通道：mesh `10.144.144.3:5244` 优先，公网 `api-drive.mangoqwq.com` 自动回退
+- 双通道：内网 OpenList 优先（MUSE2API_BACKUP_MESH_URL），公网 `api-drive.mangoqwq.com` 自动回退
   （对齐 zcode-hub 备份先例）；公网需带类浏览器 UA（WAF）。
 - 服务端异常（如当前 PROPFIND 405）→ 连续失败计数 ≥5 进入退避（30min 暂停扫描），
   本地文件永不因备份失败而删除（不丢片红线）。
@@ -14,7 +14,7 @@
     MUSE2API_BACKUP_APP_USER=app-muse2api
     MUSE2API_BACKUP_APP_PASS=          # 建议宿主 .env，不入 compose 明文
     MUSE2API_BACKUP_BASE=/Apps/muse2api
-    MUSE2API_BACKUP_MESH_URL=http://10.144.144.3:5244
+    MUSE2API_BACKUP_MESH_URL=<内网 OpenList 地址>
     MUSE2API_BACKUP_PUBLIC_URL=https://api-drive.mangoqwq.com
     MUSE2API_BACKUP_INTERVAL=300       # 扫描周期秒
     MUSE2API_BACKUP_DELETE_LOCAL=1     # 校验通过后删本地；0=只备份不删（服务端未验证期用）
@@ -47,7 +47,7 @@ def _cfg() -> dict:
         "user": getattr(CFG, "backup_app_user", "app-muse2api"),
         "pass": getattr(CFG, "backup_app_pass", ""),
         "base": (getattr(CFG, "backup_base", "/Apps/muse2api") or "/Apps/muse2api").rstrip("/"),
-        "mesh": getattr(CFG, "backup_mesh_url", "http://10.144.144.3:5244").rstrip("/"),
+        "mesh": getattr(CFG, "backup_mesh_url", "http://127.0.0.1:5244").rstrip("/"),
         "public": getattr(CFG, "backup_public_url", "https://api-drive.mangoqwq.com").rstrip("/"),
         "interval": max(60, int(getattr(CFG, "backup_interval", 300))),
         "delete_local": bool(getattr(CFG, "backup_delete_local", True)),

@@ -112,7 +112,7 @@ class Config:
     backup_app_user: str = field(default_factory=lambda: _env("MUSE2API_BACKUP_APP_USER", "app-muse2api"))
     backup_app_pass: str = field(default_factory=lambda: _env("MUSE2API_BACKUP_APP_PASS", ""))
     backup_base: str = field(default_factory=lambda: _env("MUSE2API_BACKUP_BASE", "/Apps/muse2api"))
-    backup_mesh_url: str = field(default_factory=lambda: _env("MUSE2API_BACKUP_MESH_URL", "http://10.144.144.3:5244"))
+    backup_mesh_url: str = field(default_factory=lambda: _env("MUSE2API_BACKUP_MESH_URL", "http://127.0.0.1:5244"))
     backup_public_url: str = field(default_factory=lambda: _env("MUSE2API_BACKUP_PUBLIC_URL", "https://api-drive.mangoqwq.com"))
     backup_interval: int = field(default_factory=lambda: max(60, int(_env("MUSE2API_BACKUP_INTERVAL", "300"))))
     backup_delete_local: bool = field(default_factory=lambda: _env("MUSE2API_BACKUP_DELETE_LOCAL", "1").strip() == "1")
@@ -145,9 +145,9 @@ class Config:
     tetherpool_enabled: bool = field(
         default_factory=lambda: _env("MUSE2API_TETHERPOOL", "0").strip() == "1")
     tetherpool_url: str = field(
-        default_factory=lambda: _env("MUSE2API_TETHERPOOL_URL", "http://10.144.144.9:9100"))
+        default_factory=lambda: _env("MUSE2API_TETHERPOOL_URL", "http://127.0.0.1:9100"))
     tetherpool_gateway: str = field(
-        default_factory=lambda: _env("MUSE2API_TETHERPOOL_GATEWAY", "http://10.144.144.9:9101"))
+        default_factory=lambda: _env("MUSE2API_TETHERPOOL_GATEWAY", "http://127.0.0.1:9101"))
     tetherpool_password: str = field(
         default_factory=lambda: _env("MUSE2API_TETHERPOOL_PASSWORD", "tetherpool"))
     tetherpool_tier: str = field(
