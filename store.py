@@ -24,7 +24,10 @@ ESSENTIAL_COOKIES = ("hatch_sess",)
 
 _FP_CHROME_MAJOR_MIN, _FP_CHROME_MAJOR_MAX = 130, 135
 _FP_PLATFORMS = ("Windows", "macOS", "Linux")
-_FP_LOCALES = ("en-US", "en-GB", "zh-CN", "zh-TW", "ja-JP", "de-DE", "fr-FR")
+# patch22i：muse.ai composer 在非英语 Accept-Language 下附件处理树不挂载
+# （容器内对照实验：de-DE → setFileInputFiles 0/1、form_len=0；en-US → OK）。
+# 指纹多样性以设备/时区/屏幕维度保留，语言维度锁英语系。
+_FP_LOCALES = ("en-US", "en-GB")
 _FP_TIMEZONES = ("America/New_York", "America/Chicago", "America/Los_Angeles",
                  "Europe/London", "Europe/Berlin", "Asia/Tokyo",
                  "Asia/Shanghai", "Asia/Hong_Kong")

@@ -673,6 +673,16 @@ class MuseEngine:
         """
         if not fp:
             return
+        # patch22i 防御层：muse.ai composer 在非英语 Accept-Language 下附件
+        # 处理树不挂载（容器内对照：de-DE → attach 0/1 form_len=0；en-US → OK）。
+        # 语言维度强制英语系——存量非英语档案（de-DE 等）即时生效，无需改库；
+        # 时区/屏幕/硬件等其它指纹维度不受影响。
+        _lang = str(fp.get("accept_language") or "")
+        if not _lang.lower().startswith("en"):
+            fp = dict(fp, accept_language="en-US",
+                      locale=str(fp.get("locale") or "") if str(
+                          fp.get("locale") or "").lower().startswith("en")
+                      else "en-US")
         try:
             # 完整 client hints（高熵位），Chrome 130-135 报法
             platform = fp.get("platform") or "Windows"
