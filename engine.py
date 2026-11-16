@@ -972,12 +972,21 @@ class MuseEngine:
         return out
 
     def _wait_ws_ready(self, page: CDP, timeout: float = 15.0) -> bool:
-        """等待 muse.ai 页面完成 React hydration 且不再处于 Connecting... 状态。"""
+        """等待 muse.ai 页面完成 React hydration 且不再处于 Connecting... 状态。
+
+        patch22e：readyState 接受 interactive——线上实证（tencent-lh WARP 出口，
+        2026-11-17 probe）主文档可长期停在 interactive（慢子资源拖住 load 事件），
+        而 textarea 已渲染、hydration=hydrated、无 Connecting...，页面功能完全
+        就绪；坚持 'complete' 会把可用页面误判为超时（page_prep_timeout 假阳性，
+        即 OpenPet 两笔历史失败的直接根因之一）。可交互判定以 textarea+hydration
+        +无 Connecting... 为准，比文档加载事件更贴近真实可用性。
+        """
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
                 st = page.js("""(function(){
-                    if (document.readyState !== 'complete') return 'loading';
+                    var rs = document.readyState;
+                    if (rs !== 'complete' && rs !== 'interactive') return 'loading';
                     if (!document.querySelector('textarea')) return 'no-ta';
                     var h = document.querySelector('[data-hatch-shell-hydration-state]');
                     if (h && h.getAttribute('data-hatch-shell-hydration-state') !== 'hydrated') return 'hydrating';
@@ -1150,9 +1159,11 @@ class MuseEngine:
             raise MuseAuthError("会话已被 muse.ai 登出（可能被其它登录挤掉或触发风控），"
                                 "请用浏览器扩展重新导入 cookie；未提交任何生成请求")
         # patch22：带证据的超时分类——不是账号失效，也不是会话失效。
+        # patch22e：ready 只把「非 complete 且非 interactive」算未加载——
+        # interactive+textarea+hydrated 是功能就绪页，不会走到这里。
         hint = []
-        if not d.get("ready") or d.get("ready") != "complete":
-            hint.append("主文档未完成加载")
+        if d.get("ready") not in ("complete", "interactive"):
+            hint.append("主文档未完成加载(%s)" % (d.get("ready") or "?"))
         if not d.get("ta"):
             hint.append("输入框未渲染")
         if d.get("hydration") and d.get("hydration") != "hydrated":
@@ -2271,8 +2282,12 @@ class MuseEngine:
                     break
                 time.sleep(0.3)
             else:
+                # patch22d：上传确认失败属提交前失败——带 stage/code/retryable，
+                # worker 据此落 safe_to_resubmit=True（重发零计费风险），并让
+                # app 层 attempt 链能按提交前失败语义处理。
                 raise MuseGenerationError(
-                    f"参考素材上传未确认（{int(attached_count or 0)}/{len(files)}），已停止生成")
+                    f"参考素材上传未确认（{int(attached_count or 0)}/{len(files)}），已停止生成",
+                    code="upload_unconfirmed", stage="upload", retryable=True)
             time.sleep(0.5)
             return {"dir": upload_dir, "hashes": hashes}
         except Exception:
