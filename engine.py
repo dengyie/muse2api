@@ -989,7 +989,12 @@ class MuseEngine:
                     if (rs !== 'complete' && rs !== 'interactive') return 'loading';
                     if (!document.querySelector('textarea')) return 'no-ta';
                     var h = document.querySelector('[data-hatch-shell-hydration-state]');
-                    if (h && h.getAttribute('data-hatch-shell-hydration-state') !== 'hydrated') return 'hydrating';
+                    // patch22h：fail-closed——标记元素不存在 = React 尚未挂载
+                    // hydration 状态节点，事件委托同样未就绪（线上实证半加载页
+                    // 此处 h 为 null 被旧逻辑静默放过 → setFileInputFiles 的
+                    // change 事件无人处理 → 附件永不渲染）。必须有标记且已 hydrated。
+                    if (!h) return 'hydrating';
+                    if (h.getAttribute('data-hatch-shell-hydration-state') !== 'hydrated') return 'hydrating';
                     var b = document.body ? (document.body.innerText || '') : '';
                     if (b.indexOf('Connecting...') !== -1) return 'connecting';
                     // Empty composers may not render Send until text has been entered.
@@ -2257,6 +2262,10 @@ class MuseEngine:
         # 文件设进无 handler 的 input，附件永远不出现（30s 超时假失败）。
         # 就绪判定 = composer root 内含 input[type=file] 且 root 内容非空。
         _composer_ready_js = "(function(){" + self._COMPOSER_ROOTS_JS + """
+            var h = document.querySelector('[data-hatch-shell-hydration-state]');
+            // patch22h：与 _wait_ws_ready 同语义 fail-closed——hydration 标记
+            // 缺失 = React 事件委托未挂载，附件确认按钮永远数不到。
+            if (!h || h.getAttribute('data-hatch-shell-hydration-state') !== 'hydrated') return false;
             var roots = __composerRoots();
             for (var r of roots) {
                 if (r && r.querySelector('input[type=file]') && r.innerHTML.length > 200) return true;
