@@ -1924,6 +1924,28 @@ def get_video(task_id: str, _=Depends(auth)):
     return out
 
 
+@app.get("/v1/videos/{task_id}/content")
+@app.get("/v1/videos/generations/{task_id}/content")
+def get_video_content(task_id: str, _=Depends(auth)):
+    """patch22j：OpenPet 契约的成品字节直取端点。等价于先 GET /v1/videos/{id}
+    再 GET url，但一步到位且只认已完成的视频任务——未完成/失败/无成品一律
+    native_video_unavailable，绝不 substitute。"""
+    t = store.get_task(task_id)
+    if not t or t.get("kind") != "video":
+        raise HTTPException(404, "task 不存在")
+    if t.get("status") not in ("completed", "succeeded", "success", "done"):
+        raise HTTPException(409, "任务尚未完成，暂无成品可下载")
+    vurl = t.get("url") or (t.get("result") or {}).get("url") \
+        or (t.get("video") or {}).get("url") or ""
+    name = vurl.rstrip("/").rsplit("/", 1)[-1]
+    if not name or "/" in name or "\\" in name or ".." in name:
+        raise HTTPException(503, "native_video_unavailable")
+    p = os.path.join(CFG.media_dir, name)
+    if not os.path.isfile(p):
+        raise HTTPException(503, "native_video_unavailable")
+    return FileResponse(p, media_type="video/mp4")
+
+
 # ------------------------- 对话（OpenAI 兼容） -------------------------
 def _sse(obj: dict) -> str:
     return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
