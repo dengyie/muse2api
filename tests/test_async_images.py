@@ -194,7 +194,8 @@ async def check(source, home):
         response = await client.post("/v1/videos", json={
             "prompt": "animate two references", "duration": 6,
             "images": ["data:image/png;base64,c3RhcnQ=", "data:image/png;base64,c3R5bGU="]})
-        assert response.status_code == 200
+        if response.status_code != 200:
+            raise AssertionError(f"video POST -> {response.status_code}: {response.body[:400]}")
         video_id = response.json()["task_id"]
         for _ in range(100):
             video = await client.get("/v1/videos/" + video_id)
@@ -253,7 +254,9 @@ async def check(source, home):
 
         response = await client.post("/v1/images/generations", json={"prompt": "FAIL_FIXTURE", "async": True})
         done = await finish(response.json()["task_id"])
-        assert done["status"] == "failed" and done["error"] == "fixture generation failed"
+        assert done["status"] == "failed"
+        # 二开 patch9：错误串带机器可读 code 前缀「[code] 原文」——原文必须保留
+        assert done["error"].endswith("fixture generation failed")
         assert (await client.get("/v1/images/tasks/missing")).status_code == 404
         assert (await client.get("/v1/images/tasks/" + tid,
                                  headers={"Authorization": "Bearer wrong"})).status_code == 401

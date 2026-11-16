@@ -58,6 +58,9 @@ with tempfile.TemporaryDirectory() as home:
     engine.extract_bytes = lambda src, expect: (
         originals[int(src.split("-")[1])] if src.startswith("upload-") else b"generated-result",
         "video/mp4", src)
+    # patch10a 的 1024B/魔数校验会拒绝 16B 纯文本 fixture；本段验证的是
+    # 上传哈希去重与成品落盘，媒体校验本身由上面 reject 系列覆盖，这里跳过。
+    engine._verify_media_bytes = lambda data, ext, expect: None
     with patch("engine.time.sleep", lambda value: None):
         result = engine._generate_attached("fixture", "video", float("inf"), None, None,
                                            {hashlib.sha256(x).hexdigest() for x in originals})

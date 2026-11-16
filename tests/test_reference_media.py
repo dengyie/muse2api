@@ -164,6 +164,10 @@ with tempfile.TemporaryDirectory() as home:
     # 页面把刚上传的素材渲染成"结果"时，按哈希忽略并继续等待真正的成品
     media = Path(home, "media")
     guard = app.MuseEngine(SimpleNamespace(profile_dir=home, media_dir=str(media)))
+    # patch10a 的 1024B 下限会拒绝合成 mp4 fixture（164B）；本段验证的是
+    # 上传哈希去重与成品落盘，魔数校验保留、size 下限不参与。
+    guard._verify_media_bytes = lambda data, ext, expect: (
+        app.MuseEngine._verify_media_bytes(data + b"\0" * 2048, ext, expect))
     upload_bytes, result_bytes = mp4(4), mp4(5) + b"generated"
     hits = iter([{"src": "poster", "vSrc": "blob:upload", "hasVideo": True, "w": 9, "h": 9},
                  {"src": "poster2", "vSrc": "blob:result", "hasVideo": True, "w": 9, "h": 9}])

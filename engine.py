@@ -451,8 +451,8 @@ class MuseEngine:
         mediabak 只扫 media_dir，不受影响。
         """
         try:
-            d = self.cfg.download_dir
-            if not os.path.isdir(d):
+            d = getattr(self.cfg, "download_dir", None)
+            if not d or not os.path.isdir(d):
                 return
             removed = 0
             for name in os.listdir(d):
@@ -1513,8 +1513,11 @@ class MuseEngine:
             time.sleep(0.6)
             self._scroll_bottom()
             atts = self.attachments()
-            # patch11：观测消息提交收据与附件挂载痕迹（每轮刷新）
-            if not user_bubble_seen:
+            # patch11：观测消息提交收据与附件挂载痕迹（每轮刷新）。
+            # patch21c：user_bubble_seen 只被带图分层判定（L2/L3）消费，
+            # 纯文本等待不发这条 CDP 往返（省一次 js 调用，也让 page.js 的
+            # 调用序列在无附件场景与上游语义一致）。
+            if has_upload and not user_bubble_seen:
                 cur_user = self._user_count()
                 if cur_user > base_user_cnt:
                     user_bubble_seen = True

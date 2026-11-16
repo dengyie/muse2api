@@ -43,7 +43,14 @@ async def request(method, path, body=None):
                          (b"content-length", str(len(payload)).encode())]}
 
     async def receive():
-        return {"type": "http.request", "body": payload, "more_body": False}
+        # ASGI 规范：请求体只发一次；之后任何 receive 必须等到 disconnect。
+        # BaseHTTPMiddleware（patch13 body-size guard）会在响应完成后再次
+        # receive——返回 http.request 会触发 RuntimeError: Unexpected message。
+        if not receive.sent:
+            receive.sent = True
+            return {"type": "http.request", "body": payload, "more_body": False}
+        await asyncio.Event().wait()  # 永久挂起 = 规范中的等待 disconnect
+    receive.sent = False
 
     async def send(message):
         messages.append(message)
@@ -208,7 +215,8 @@ class AccountProxyTests(unittest.TestCase):
                 patch.object(engine, "_apply_cookies"), patch.object(engine, "_wait_ws_ready", return_value=True):
             self.assertIs(engine.ensure_page({}, account_id="fixture"), new_page)
             old_page.close.assert_called_once()
-            open_page.assert_called_once_with(proxy=new_proxy)
+            # patch17：ensure_page 现在总会带上 fingerprint（无档案 = None）
+            open_page.assert_called_once_with(proxy=new_proxy, fingerprint=None)
         engine.close_current_page()
 
     def test_authenticated_http_and_connect_and_shutdown(self):

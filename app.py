@@ -438,9 +438,7 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
 
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                      timeout: int, account_id: str | None):
-    """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
-    无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
-    若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。"""
+    """Acquire a generation slot before the account lease; release both after cleanup."""
     import queue
     q = queue.Queue(maxsize=100)
     stop_event = threading.Event()
@@ -451,7 +449,12 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
         cur_exp = expires
         last_exc = None
         leased_id = None
+        slot_acquired = False
         try:
+            slot_acquired = GEN_LOCK.acquire(timeout=timeout)
+            if not slot_acquired:
+                q.put(("error", MuseGenerationError("等待对话并发槽位超时")))
+                return
             for attempt in range(2):
                 if stop_event.is_set():
                     return
@@ -461,8 +464,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         leased_id = None
                     try:
                         alt = ACCOUNT_POOL.acquire(rotate=True, force_rotate=True, timeout=timeout)
-                    except Exception as exc:  # patch13(F8)：无空闲账号也要让客户端收到错误
-                        last_exc = exc
+                    except Exception:
                         break
                     if not alt or alt["id"] == cur_id:
                         if alt:
@@ -485,26 +487,17 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         if refreshed:
                             cur_cookies = refreshed["cookies"]
                             cur_exp = refreshed.get("cookies_exp")
-                    with GEN_LOCK:
+                    if stop_event.is_set():
+                        return
+                    engine.start()
+                    for chunk in engine.chat_stream(
+                        cur_cookies, prompt, cur_exp, timeout,
+                        account_id=cur_id, stop_event=stop_event
+                    ):
+                        yielded = True
+                        q.put(("data", chunk))
                         if stop_event.is_set():
                             return
-                        engine.start()
-                        for chunk in engine.chat_stream(
-                            cur_cookies, prompt, cur_exp, timeout,
-                            account_id=cur_id, stop_event=stop_event
-                        ):
-                            yielded = True
-                            # patch13(F1)：带超时轮询 stop_event——阻塞式 put 在
-                            # GEN_LOCK 内遇慢消费者会永久锁死全服务（stop_event
-                            # 检查在 put 返回后，唤醒不了已阻塞的 put）。
-                            while not stop_event.is_set():
-                                try:
-                                    q.put(("data", chunk), timeout=0.5)
-                                    break
-                                except queue.Full:
-                                    continue
-                            if stop_event.is_set():
-                                return
                     if cur_id:
                         store.mark(cur_id, True, "")
                         _sync_cookies(cur_id)
@@ -526,17 +519,22 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         break
             if last_exc is not None:
                 q.put(("error", last_exc))
-        except Exception as exc:  # noqa: BLE001 — patch13(F8)：acquire 等在 inner try 外的异常也要入队
-            try:
-                q.put(("error", exc))
-            except Exception:  # noqa: BLE001
-                pass
+        except Exception as exc:
+            q.put(("error", exc))
         finally:
-            if leased_id:
-                ACCOUNT_POOL.release(leased_id)
-            engine.close_current_page()
-            _clear_account_proxy()
-            q.put(("done", None))
+            try:
+                if leased_id:
+                    ACCOUNT_POOL.release(leased_id)
+                engine.close_current_page()
+            except Exception as exc:
+                log.warning("对话清理失败: %s", type(exc).__name__)
+            finally:
+                try:
+                    _clear_account_proxy()
+                finally:
+                    if slot_acquired:
+                        GEN_LOCK.release()
+                    q.put(("done", None))
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -1372,8 +1370,10 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                             log.info("【TetherPool】重绑已完成，单号池原地重试 %s (%s)", cur_acc.get("label"), cur_acc["id"])
                             continue
                         break
-                    _generation_callback(on_account, cur_acc["id"], attempt + 1)
                     log.info("【生图/视频自动切号】切换到备用账号 %s (%s) 重试...", cur_acc.get("label"), cur_acc["id"])
+            # 上游 1.6.11 语义：每次 attempt（含首次）都上报账号归属（TaskTiming.account
+            # 记录 task.account/attempt，失败任务也保留账号溯源）。
+            _generation_callback(on_account, cur_acc["id"], attempt + 1)
             try:
                 _bind_account_proxy(cur_acc)
                 refreshed = _renew_and_persist(cur_acc["id"], wake_vm=True, force=(attempt > 0))
@@ -1762,19 +1762,23 @@ async def create_video(req: VideoRequest, request: Request, _=Depends(auth),
                             "progress": existing.get("progress", 0),
                             "created_at": existing["created_at"]}
                 del IDEMPOTENCY_VIDEOS[key_hash]  # 指向的任务已不在，索引项失效
-        for existing in list(store.tasks.values()):
-            if existing.get("video_request_key") == key_hash:
-                if existing.get("video_request_hash") != request_hash:
-                    # patch18：409 detail 带冲突 task_id，排障不必进容器翻库
-                    raise HTTPException(409, "Idempotency-Key reused with different request (existing task: %s)" % existing["id"])
-                # patch14(F4)：failed 任务不算幂等命中——同 key 重放允许重建
-                # （失败后清索引可能因竞态漏掉，这里双保险）。
-                if existing.get("status") == "failed":
-                    continue
-                return {"id": existing["id"], "task_id": existing["id"],
-                        "object": "video.task", "status": existing["status"],
-                        "progress": existing.get("progress", 0),
-                        "created_at": existing["created_at"]}
+        if key_hash:
+            # patch21b：task 兜底扫描只在带 Idempotency-Key 时进行——key_hash=None
+            # 时会误匹配一切无 key 任务（含 image task）并错报 409
+            # （test_async_images 首个 /v1/videos POST 即触发，合并时引入）。
+            for existing in list(store.tasks.values()):
+                if existing.get("video_request_key") == key_hash:
+                    if existing.get("video_request_hash") != request_hash:
+                        # patch18：409 detail 带冲突 task_id，排障不必进容器翻库
+                        raise HTTPException(409, "Idempotency-Key reused with different request (existing task: %s)" % existing["id"])
+                    # patch14(F4)：failed 任务不算幂等命中——同 key 重放允许重建
+                    # （失败后清索引可能因竞态漏掉，这里双保险）。
+                    if existing.get("status") == "failed":
+                        continue
+                    return {"id": existing["id"], "task_id": existing["id"],
+                            "object": "video.task", "status": existing["status"],
+                            "progress": existing.get("progress", 0),
+                            "created_at": existing["created_at"]}
         # patch13(F3)：video 是最贵上游资源，与 image 侧同款准入上限。
         if sum(t.get("kind") == "video" and t.get("status") in ("queued", "processing")
                for t in store.tasks.values()) >= 8:
@@ -2471,6 +2475,9 @@ def test_account_proxy(aid: str, req: ProxyTestRequest | None = None, _=Depends(
             result.update(session_ok=False, message="代理可连接，但 Muse 会话认证失败，请重新导入 Cookie")
         except MuseProxyError as exc:
             result["message"] = str(exc)
+        except MuseSessionUnavailable as exc:
+            _persist_session_cookies(aid, exc.cookies, exc.cookies_exp)
+            result.update(session_ok=False, message=str(exc))
         except MuseGenerationError as exc:
             result.update(session_ok=False, message=str(exc))
         except (requests.RequestException, ValueError, KeyError, TypeError):
@@ -2996,6 +3003,11 @@ def _probe_account_sync(aid: str, check_quota: bool = False) -> dict:
     except MuseAuthError as exc:
         store.touch_keepalive(aid, False, f"保活认证失败: {str(exc)[:200]}")
         return {"ok": False, "id": aid, "error": str(exc)}
+    except MuseSessionUnavailable as exc:
+        # 上游 1.6.11：未分配工作区响应可能轮换 cookie，落库但不算成功。
+        _persist_session_cookies(aid, exc.cookies, exc.cookies_exp)
+        store.touch_keepalive(aid, None, f"保活未确认（保留账号状态）: {str(exc)[:200]}")
+        return {"ok": False, "id": aid, "error": str(exc), "cookies_rotated": exc.rotated}
     except Exception as exc:
         store.touch_keepalive(aid, None, f"保活未确认（保留账号状态）: {str(exc)[:200]}")
         return {"ok": False, "id": aid, "error": str(exc)}
@@ -3081,7 +3093,7 @@ async def _keepalive_loop():
     log.info("【自动保活守护进程】已启动，检测周期: 15 分钟")
     await asyncio.sleep(1)
     try:
-        await asyncio.to_thread(_check_update_sync, True, _KEEPALIVE_AUTO_UPGRADE)
+        await asyncio.to_thread(_check_update_sync, True)
     except Exception:
         pass
     try:
@@ -3090,7 +3102,7 @@ async def _keepalive_loop():
         log.warning("【浏览器预热】异常: %s", e)
     while True:
         try:
-            await asyncio.to_thread(_check_update_sync, True, _KEEPALIVE_AUTO_UPGRADE)
+            await asyncio.to_thread(_check_update_sync, True)
         except Exception:
             pass
         try:
@@ -3125,9 +3137,17 @@ def get_keepalive_status(_=Depends(auth)):
 
 
 # ------------------------- 仓库实时更新检测、通知与一键在线升级 -------------------------
-REPO_URL = "https://github.com/czg86389-hub/muse2api"
+# 上游 1.6.11：仓库/分支/托管部署可配；检查只读、升级钉住单一已验证提交。
+REPO_SLUG = os.environ.get("MUSE2API_REPOSITORY", "czg86389-hub/muse2api")
+if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", REPO_SLUG):
+    REPO_SLUG = "czg86389-hub/muse2api"
+REPO_REF = os.environ.get("MUSE2API_REPO_REF", "main")
+REPO_URL = f"https://github.com/{REPO_SLUG}"
+MANAGED_DEPLOYMENT = os.environ.get("MUSE2API_MANAGED_DEPLOYMENT", "0") == "1"
 TRACKED_REPO_PATHS = [
     "app.py", "engine.py", "store.py", "cdp.py", "config.py", "proxy.py",
+    "tetherpool.py", "mediabak.py", "generation_timing.py", "thumbnails.py",
+    "GENERATION_QUEUE.md", "VERSION_REPORTING.md",
     "admin.html", "README.md", "version.json", "requirements.txt",
     "Dockerfile", "docker-compose.yml", ".env.example", ".gitignore",
     "LICENSE", "extension", "deploy", "tools",
@@ -3196,255 +3216,135 @@ def _ensure_git_repo(token: str = ""):
     _git(["config", "user.email", "czg86389-hub@users.noreply.github.com"])
 
 
-_SILENT_UPGRADE_LOCK = threading.Lock()
-
-
-# 二开（patch21）：静默自更新封堵——2026-11-16 01:44 事故根因。本 fork 的
-# patch7..21 全部不在上游 main 里，任何 Tarball 静默覆盖都会整树回退、
-# tetherpool/指纹链路丢失（当天 7 个视频任务超时即此因）。自更新必须显式
-# 用 MUSE2API_AUTO_UPGRADE=1 选择开启，默认永久关闭；升级请走管理端
-# /admin/update/check（人工触发，不入 Tarball 覆盖路径）。
-def _read_env_flag(key: str, default: bool = False) -> bool:
-    val = (_read_env_key(key) or "").strip().lower()
-    if not val:
-        return default
-    return val in ("1", "true", "yes", "on")
-
-
-_KEEPALIVE_AUTO_UPGRADE = _read_env_flag("MUSE2API_AUTO_UPGRADE", default=False)
-
-
-def _silent_upgrade_worker():
-    """后台静默拉取最新代码并在空闲时平滑重启进程（不发送任何前端更新通知）。"""
-    if not _KEEPALIVE_AUTO_UPGRADE:
-        log.info("【静默升级】MUSE2API_AUTO_UPGRADE 未开启（二开 patch21 封堵），跳过 Tarball 覆盖")
-        return
-    if not _SILENT_UPGRADE_LOCK.acquire(blocking=False):
-        return
-    try:
-        res = _upgrade_from_github_sync()
-        if res.get("ok"):
-            for _ in range(180):
-                with ACCOUNT_POOL.cond:
-                    busy = bool(ACCOUNT_POOL.busy_accounts)
-                if not busy:
-                    break
-                time.sleep(1)
-            time.sleep(0.5)
-            try:
-                engine.stop()
-            except Exception:
-                pass
-            os._exit(0)
-    except Exception:
-        pass
-    finally:
-        _SILENT_UPGRADE_LOCK.release()
-
-
-def _check_update_sync(force: bool = False, _auto_upgrade: bool = True) -> dict:
-    """检测 GitHub 官方仓库 (czg86389-hub/muse2api) 是否有新版本或新提交。
-    发现更新时在后台静默自动拉取升级，不触发前端弹窗或横幅通知。"""
+# 二开（patch21）：上游 1.6.11 已彻底移除「静默自升级」——检查只读、升级必须
+# 管理员显式 POST 且钉住单一已验证提交。这里不再保留任何 Tarball 自动覆盖路径：
+# 2026-11-16 01:44 事故（自更新把 /app 覆盖成无补丁的上游 main、7 个视频任务
+# 全部超时）即旧的静默升级 worker 所致，本 fork 补丁永不在上游里。
+def _check_update_sync(force: bool = False) -> dict:
+    """A check is read-only. Report installed files and remote state separately."""
     now = time.time()
-    if not force and _UPDATE_CACHE["data"] and (now - _UPDATE_CACHE["ts"]) < 90:
+    if not force and _UPDATE_CACHE["data"] and now - _UPDATE_CACHE["ts"] < 90:
         return _UPDATE_CACHE["data"]
-
     import requests
-    token = _read_env_key("GITHUB_TOKEN")
-    local_ver_obj = _read_local_version()
-    local_version = str(local_ver_obj.get("version") or "1.5.0")
-
-    has_git = os.path.isdir(os.path.join(BASE_DIR, ".git"))
-    local_sha, local_msg, local_ts = "", "", 0
-    if has_git:
-        try:
-            r_sha = _git(["rev-parse", "--short", "HEAD"])
-            if r_sha.returncode == 0:
-                local_sha = r_sha.stdout.strip()[:7]
-            r_log = _git(["log", "-1", "--format=%s||%ct"])
-            if r_log.returncode == 0 and "||" in r_log.stdout:
-                parts = r_log.stdout.strip().split("||", 1)
-                local_msg = parts[0]
-                local_ts = int(parts[1])
-        except Exception:
-            pass
-
-    if not local_sha:
-        # 上游 1.6.11：镜像构建期注入 MUSE2API_BUILD_SHA（Dockerfile ARG），
-        # Tarball 部署无 .git 时的版本溯源兜底。
-        local_sha = os.environ.get("MUSE2API_BUILD_SHA", "").strip()[:7]
-
+    from urllib.parse import quote
+    local = _read_local_version()
+    local_version = str(local.get("version") or "unknown")
+    local_sha = os.environ.get("MUSE2API_BUILD_SHA", "").strip()
+    has_git = os.path.exists(os.path.join(BASE_DIR, ".git"))
+    if not local_sha and has_git:
+        result = _git(["rev-parse", "HEAD"])
+        if result.returncode == 0:
+            local_sha = result.stdout.strip()
     if not local_sha and os.path.isfile(_installed_sha_file()):
-        try:
-            with open(_installed_sha_file(), encoding="utf-8") as f:
-                local_sha = f.read().strip()[:7]
-        except OSError:
-            pass
-
-    remote_version = local_version
-    highlights = list(local_ver_obj.get("highlights") or [])
-    highlights_en = list(local_ver_obj.get("highlights_en") or [])
+        with open(_installed_sha_file()) as f:
+            local_sha = f.read().strip()
+    local_sha = local_sha[:7]
+    local_dirty = False
+    if has_git:
+        changed = _git(["status", "--porcelain", "--", *TRACKED_REPO_PATHS])
+        local_dirty = changed.returncode == 0 and bool(changed.stdout.strip())
+    remote_version, remote_sha, remote_commit, remote_msg, remote_time = "", "", "", "", ""
+    commits, highlights, highlights_en, errors = [], [], [], []
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "muse2api-updater"}
+    token = _read_env_key("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     try:
-        rv = requests.get(
-            f"https://raw.githubusercontent.com/czg86389-hub/muse2api/main/version.json?t={int(now)}",
-            timeout=6,
-        )
-        if rv.status_code == 200:
-            rvj = rv.json()
-            if isinstance(rvj, dict):
-                remote_version = str(rvj.get("version") or remote_version)
-                if rvj.get("highlights"):
-                    highlights = list(rvj["highlights"])
-                    # 远端没有英文版时，仅在版本相同时沿用本地英文说明，否则界面回退显示中文
-                    highlights_en = list(rvj.get("highlights_en")
-                                         or (highlights_en if remote_version == local_version else []))
+        response = requests.get(
+            f"https://api.github.com/repos/{REPO_SLUG}/commits",
+            params={"sha": REPO_REF, "per_page": 5}, headers=headers, timeout=6)
+        response.raise_for_status()
+        raw_commits = response.json()
+        remote_commit = raw_commits[0]["sha"] if raw_commits else ""
+        for commit in raw_commits:
+            info = commit.get("commit") or {}
+            commits.append({"sha": commit["sha"][:7], "message": info.get("message", "").split("\n")[0],
+                            "date": (info.get("committer") or {}).get("date", ""),
+                            "url": commit.get("html_url") or REPO_URL})
+        if commits:
+            remote_sha, remote_msg, remote_time = (commits[0][k] for k in ("sha", "message", "date"))
     except Exception:
-        pass
-
-    remote_sha, remote_msg, remote_time = "", "", ""
-    recent_commits = []
+        errors.append("远端提交读取失败")
+    # Pin release notes and version to the same commit as the reported remote SHA.
     try:
-        headers = {"Accept": "application/vnd.github.v3+json", "User-Agent": "muse2api-updater"}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        resp = requests.get(
-            "https://api.github.com/repos/czg86389-hub/muse2api/commits?sha=main&per_page=5",
-            headers=headers,
-            timeout=6,
-        )
-        if resp.status_code == 200 and isinstance(resp.json(), list):
-            commits = resp.json()
-            for idx, c in enumerate(commits):
-                sha7 = (c.get("sha") or "")[:7]
-                c_msg = ((c.get("commit") or {}).get("message") or "").splitlines()[0]
-                if "linux" in c_msg.lower():
-                    c_msg = "perf: optimize session keepalive and UI rendering"
-                c_date = (((c.get("commit") or {}).get("committer") or {}).get("date") or "")
-                c_url = c.get("html_url") or f"{REPO_URL}/commit/{sha7}"
-                if idx == 0:
-                    remote_sha = sha7
-                    remote_msg = c_msg
-                    remote_time = c_date
-                recent_commits.append({
-                    "sha": sha7,
-                    "message": c_msg,
-                    "date": c_date,
-                    "url": c_url,
-                })
+        response = requests.get(
+            f"https://raw.githubusercontent.com/{REPO_SLUG}/{quote(remote_commit or REPO_REF, safe='')}/version.json",
+            timeout=6)
+        response.raise_for_status()
+        remote = response.json()
+        remote_version = str(remote.get("version") or "")
+        highlights = list(remote.get("highlights") or [])
+        highlights_en = list(remote.get("highlights_en") or [])
     except Exception:
-        pass
-
-    # 若用户通过 Docker/ZIP 部署（无 .git）且首次运行版本一致，记录初始基准 SHA
-    if not local_sha and remote_sha and local_version == remote_version:
-        local_sha = remote_sha
-        try:
-            with open(_installed_sha_file(), "w", encoding="utf-8") as f:
-                f.write(remote_sha)
-        except OSError:
-            pass
-
-    def _parse_v(v: str) -> tuple[int, ...]:
-        try:
-            return tuple(int(x) for x in re.findall(r"\d+", v))
-        except Exception:
-            return (0,)
-
-    needs_upgrade = False
-    if remote_sha and local_sha:
-        needs_upgrade = (remote_sha != local_sha)
-    elif remote_version and local_version:
-        needs_upgrade = _parse_v(remote_version) > _parse_v(local_version)
-
-    if needs_upgrade and _auto_upgrade:
-        threading.Thread(target=_silent_upgrade_worker, daemon=True).start()
-
-    # 静默式更新：对外始终返回已是最新，不触发任何弹窗或横幅通知
-    effective_sha = remote_sha or local_sha
-    effective_ver = remote_version or local_version
-    data = {
-        "repo_url": REPO_URL,
-        "has_git": has_git,
-        "local_version": effective_ver,
-        "remote_version": effective_ver,
-        "local_sha": effective_sha,
-        "local_msg": remote_msg or local_msg,
-        "local_ts": local_ts,
-        "remote_sha": effective_sha,
-        "remote_msg": remote_msg,
-        "remote_time": remote_time,
-        "has_update": False,
-        "up_to_date": True,
-        "highlights": highlights,
-        "highlights_en": highlights_en,
-        "recent_commits": recent_commits,
-        "checked_at": int(now),
-    }
-    _UPDATE_CACHE["ts"] = now
-    _UPDATE_CACHE["data"] = data
+        errors.append("远端版本文件读取失败")
+    verified = bool(local_sha and remote_sha and remote_version)
+    has_update = bool((local_sha and remote_sha and local_sha != remote_sha) or
+                      (remote_version and local_version != remote_version))
+    data = {"repo_url": REPO_URL, "repo_ref": REPO_REF, "has_git": has_git,
+            "local_version": local_version, "local_sha": local_sha,
+            "remote_version": remote_version, "remote_sha": remote_sha, "remote_commit": remote_commit,
+            "remote_msg": remote_msg, "remote_time": remote_time,
+            "has_update": has_update, "up_to_date": (not has_update and not local_dirty) if verified else None,
+            "local_dirty": local_dirty,
+            "check_error": "; ".join(errors), "managed_deployment": MANAGED_DEPLOYMENT,
+            "highlights": highlights, "highlights_en": highlights_en,
+            "recent_commits": commits, "checked_at": int(now)}
+    _UPDATE_CACHE.update(ts=now, data=data)
     return data
 
 
 def _upgrade_from_github_sync() -> dict:
-    """从 GitHub 拉取最新代码覆盖核心文件（兼容 Git 与无 Git 的 Docker/ZIP 环境），绝不触碰 .env 与 data/。"""
+    """Explicit upgrades pin one verified remote commit and preserve deployment data."""
+    if MANAGED_DEPLOYMENT:
+        raise HTTPException(409, "此实例通过镜像部署，请从配置的仓库分支构建并更新容器")
+    if GEN_LOCK.locked() or any(t.get("status") in ("queued", "processing") for t in store.tasks.values()):
+        raise HTTPException(409, "仍有任务排队或运行，请等待任务完成后更新")
     import requests
     import tarfile
-
-    token = _read_env_key("GITHUB_TOKEN")
+    target = _check_update_sync(force=True).get("remote_commit", "")
+    if not re.fullmatch(r"[0-9a-f]{40}", target):
+        raise HTTPException(502, "无法确认远端目标提交，未执行更新")
     upgraded_via = ""
     try:
-        _ensure_git_repo(token)
-        f_res = _git(["fetch", "origin", "main"], timeout=45)
-        if f_res.returncode == 0:
-            _git(["checkout", "-f", "origin/main", "--", "."])
-            _git(["reset", "--mixed", "origin/main"])
-            upgraded_via = "git"
-    except Exception as e:
-        log.warning("Git 拉取更新失败，将使用 Tarball 方式更新: %s", e)
-
+        _ensure_git_repo(_read_env_key("GITHUB_TOKEN"))
+        for command in (["fetch", "origin", REPO_REF],
+                        ["checkout", "-f", target, "--", "."],
+                        ["reset", "--mixed", target]):
+            result = _git(command, timeout=45)
+            result.check_returncode()
+        upgraded_via = "git"
+    except Exception as exc:
+        log.warning("Git 更新未完成，尝试固定提交归档 (%s)", type(exc).__name__)
     if not upgraded_via:
-        resp = requests.get(
-            "https://codeload.github.com/czg86389-hub/muse2api/tar.gz/refs/heads/main",
-            timeout=60,
-        )
-        if resp.status_code != 200:
-            raise HTTPException(502, f"下载 GitHub 更新包失败 (HTTP {resp.status_code})")
-        protected_files = {".env", "data/accounts.json", "data/tasks.json"}
-        with tarfile.open(fileobj=io.BytesIO(resp.content), mode="r:gz") as tar:
-            for member in tar.getmembers():
+        response = requests.get(f"https://codeload.github.com/{REPO_SLUG}/tar.gz/{target}", timeout=60)
+        if response.status_code != 200:
+            raise HTTPException(502, f"下载更新包失败 (HTTP {response.status_code})")
+        with tarfile.open(fileobj=io.BytesIO(response.content), mode="r:gz") as archive:
+            for member in archive.getmembers():
                 parts = member.name.split("/", 1)
                 if len(parts) < 2 or not parts[1]:
                     continue
                 rel = parts[1].replace("\\", "/")
-                if ".." in rel or rel in protected_files:
+                if rel.startswith("/") or ".." in rel.split("/") or rel == ".env" or rel.startswith("data/") or rel.startswith(".git/"):
                     continue
-                target_path = os.path.join(BASE_DIR, rel)
+                path = os.path.join(BASE_DIR, rel)
                 if member.isdir():
-                    os.makedirs(target_path, exist_ok=True)
+                    os.makedirs(path, exist_ok=True)
                 elif member.isfile():
-                    os.makedirs(os.path.dirname(target_path), exist_ok=True)
-                    fobj = tar.extractfile(member)
-                    if fobj is not None:
-                        with open(target_path, "wb") as out_f:
-                            out_f.write(fobj.read())
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with archive.extractfile(member) as source, open(path, "wb") as out:
+                        out.write(source.read())
         upgraded_via = "tarball"
-
+    # Record what was installed, never a newer remote HEAD observed after the download.
+    with open(_installed_sha_file(), "w") as f:
+        f.write(target)
     _UPDATE_CACHE["ts"] = 0.0
-    status = _check_update_sync(force=True, _auto_upgrade=False)
-    if status.get("remote_sha"):
-        try:
-            with open(_installed_sha_file(), "w", encoding="utf-8") as f:
-                f.write(status["remote_sha"])
-            status["local_sha"] = status["remote_sha"]
-            status["has_update"] = False
-            status["up_to_date"] = True
-        except OSError:
-            pass
-    return {
-        "ok": True,
-        "via": upgraded_via,
-        "message": f"已成功更新至最新版本 {status.get('remote_version')} ({status.get('remote_sha')})",
-        "status": status,
-    }
+    status = _check_update_sync(force=True)
+    status["local_sha"] = target[:7]
+    status["has_update"] = bool(status.get("remote_sha") and status["remote_sha"] != target[:7])
+    status["up_to_date"] = not status["has_update"] if status.get("remote_sha") else None
+    return {"ok": True, "via": upgraded_via, "installed_sha": target,
+            "message": f"已安装版本 {_read_local_version().get('version')} ({target[:7]})", "status": status}
 
 
 @app.get("/admin/update/check")
@@ -3452,7 +3352,7 @@ def _upgrade_from_github_sync() -> dict:
 async def admin_check_update(force: bool = False, _=Depends(auth)):
     """检测上游仓库是否有新版本。patch13(F2)：加鉴权且 HTTP 路径不触发静默
     自升级（未鉴权 GET 曾可后台拉起 os._exit(0) 重启，杀掉进行中的付费生成）。"""
-    return await asyncio.to_thread(_check_update_sync, force, False)
+    return await asyncio.to_thread(_check_update_sync, force)
 
 
 @app.post("/admin/update/upgrade")
@@ -3499,7 +3399,7 @@ async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
             err = (p_res.stderr or p_res.stdout or "").strip()
             raise HTTPException(500, f"Git push 失败: {err[:300]}")
         _UPDATE_CACHE["ts"] = 0.0
-        status = _check_update_sync(force=True, _auto_upgrade=False)
+        status = _check_update_sync(force=True)
         return {
             "ok": True,
             "committed": committed,
