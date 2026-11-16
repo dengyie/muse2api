@@ -2644,6 +2644,7 @@ async def attach_probe(aid: str, _=Depends(auth)):
                 # patch22h 验证：先试重用页，attach 失败自动换全新页再试一次——
                 # 定位「API 进程重用页失败 / 外部进程新开页成功」的状态差异。
                 _attempts = []
+                info1 = _composer_probe_js(page)  # round 0 成功路径也要有 before 现场
                 for _round in range(2):
                     try:
                         res = engine._attach_images([_tiny_png()])
@@ -2674,6 +2675,8 @@ async def attach_probe(aid: str, _=Depends(auth)):
                 return {"ok": False, "before": _before,
                         "error": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
 
+    return await asyncio.to_thread(_probe)
+
 
 def _tiny_png():
     import base64 as _b64
@@ -2694,8 +2697,6 @@ def _composer_probe_js(page):
             ta_parent_has_input: ta.parentElement? !!ta.parentElement.querySelector('input[type=file]') : null,
             hydration: h?h.getAttribute('data-hatch-shell-hydration-state'):'MISSING'});
     })()""")
-
-    return await asyncio.to_thread(_probe)
 
 
 @app.post("/admin/accounts/{aid}/relogin")
