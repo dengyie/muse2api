@@ -2638,36 +2638,32 @@ async def attach_probe(aid: str, _=Depends(auth)):
         with GEN_LOCK, _account_operation(aid) as acc:
             try:
                 engine.start()
+                _mode = "reuse"
                 page = engine.ensure_page(acc["cookies"], acc.get("cookies_exp"),
                                           account_id=aid)
-                info1 = page.js("""(function(){
-                    var ta=document.querySelector('textarea');
-                    var form=ta?ta.closest('form'):null;
-                    var roots=[];
-                    try { roots = __composerRoots ? __composerRoots() : []; } catch(e) {}
-                    return JSON.stringify({url:location.href, ready:document.readyState,
-                        ta:!!ta, form_len:form?form.innerHTML.length:-1,
-                        n_file_inputs:document.querySelectorAll('input[type=file]').length,
-                        ta_parent_html_len: ta.parentElement?ta.parentElement.innerHTML.length:-1,
-                        ta_parent_has_input: ta.parentElement? !!ta.parentElement.querySelector('input[type=file]') : null,
-                        file_input_in_form: form? !!form.querySelector('input[type=file]') : null});
-                })()""")
-                # 最小 1x1 png
-                import base64 as _b64
-                tiny = _b64.b64encode(_b64.b64decode(
-                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg"
-                    "YGBgAAAABQABh6FO1AAAAABJRU5ErkJggg==")).decode()
-                res = engine._attach_images(["data:image/png;base64," + tiny])
-                info2 = page.js("""(function(){
-                    var ta=document.querySelector('textarea');
-                    var form=ta?ta.closest('form'):null;
-                    return JSON.stringify({form_len:form?form.innerHTML.length:-1,
-                        remove_btns:Array.from(document.querySelectorAll('button[aria-label]'))
-                            .map(function(b){return b.getAttribute('aria-label');})
-                            .filter(function(a){return /remove|attachment/i.test(a||'');})});
-                })()""")
-                return {"ok": True, "before": info1, "after": info2,
-                        "attach": bool(res)}
+                # patch22h 验证：先试重用页，attach 失败自动换全新页再试一次——
+                # 定位「API 进程重用页失败 / 外部进程新开页成功」的状态差异。
+                _attempts = []
+                for _round in range(2):
+                    try:
+                        res = engine._attach_images([_tiny_png()])
+                        _attempts.append({"round": _round, "mode": _mode, "ok": True})
+                        info2 = page.js("""(function(){
+                            return JSON.stringify({remove_btns:Array.from(document.querySelectorAll('button[aria-label]'))
+                                .map(function(b){return b.getAttribute('aria-label');})
+                                .filter(function(a){return /remove|attachment/i.test(a||'');})});
+                        })()""")
+                        return {"ok": True, "before": info1, "after": info2,
+                                "attempts": _attempts, "attach": True}
+                    except Exception as _ae:
+                        _attempts.append({"round": _round, "mode": _mode,
+                                          "ok": False, "err": str(_ae)[:120]})
+                        # 换全新页再试
+                        page = engine.refresh(acc["cookies"], acc.get("cookies_exp"),
+                                              account_id=aid)
+                        _mode = "fresh"
+                        info1 = _composer_probe_js(page)
+                return {"ok": False, "before": info1, "attempts": _attempts}
             except Exception as exc:  # noqa: BLE001
                 # patch22g4d：失败时也带 before 现场（诊断信息不能被异常吞掉）
                 _before = ""
@@ -2677,6 +2673,27 @@ async def attach_probe(aid: str, _=Depends(auth)):
                     pass
                 return {"ok": False, "before": _before,
                         "error": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
+
+
+def _tiny_png():
+    import base64 as _b64
+    return "data:image/png;base64," + _b64.b64encode(_b64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg"
+        "YGBgAAAABQABh6FO1AAAAABJRU5ErkJggg==")).decode()
+
+
+def _composer_probe_js(page):
+    return page.js("""(function(){
+        var ta=document.querySelector('textarea');
+        var form=ta?ta.closest('form'):null;
+        var h=document.querySelector('[data-hatch-shell-hydration-state]');
+        return JSON.stringify({url:location.href, ready:document.readyState,
+            ta:!!ta, form_len:form?form.innerHTML.length:-1,
+            n_file_inputs:document.querySelectorAll('input[type=file]').length,
+            ta_parent_html_len: ta.parentElement?ta.parentElement.innerHTML.length:-1,
+            ta_parent_has_input: ta.parentElement? !!ta.parentElement.querySelector('input[type=file]') : null,
+            hydration: h?h.getAttribute('data-hatch-shell-hydration-state'):'MISSING'});
+    })()""")
 
     return await asyncio.to_thread(_probe)
 
