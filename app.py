@@ -2297,9 +2297,19 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
     return envelope("completed", text)
 
 
+_MEDIA_MIME_EXT = {
+    ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime",
+    ".webp": "image/webp", ".png": "image/png", ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg", ".gif": "image/gif",
+}
+
+
 def _media_mime(name: str) -> str:
-    """patch22m：按扩展名给媒体 Content-Type（回源内存返回时使用；
-    兜底 application/octet-stream 由调用方保证不误标为 mp4/webp）。"""
+    """patch22m：按扩展名给媒体 Content-Type（回源内存返回时使用）。
+    显式表优先——容器内 mimetypes 注册不全（webp 实测落 octet-stream）。"""
+    ext = os.path.splitext(name)[1].lower()
+    if ext in _MEDIA_MIME_EXT:
+        return _MEDIA_MIME_EXT[ext]
     import mimetypes
     mime, _ = mimetypes.guess_type(name)
     return mime or "application/octet-stream"
