@@ -2643,9 +2643,14 @@ async def attach_probe(aid: str, _=Depends(auth)):
                 info1 = page.js("""(function(){
                     var ta=document.querySelector('textarea');
                     var form=ta?ta.closest('form'):null;
+                    var roots=[];
+                    try { roots = __composerRoots ? __composerRoots() : []; } catch(e) {}
                     return JSON.stringify({url:location.href, ready:document.readyState,
                         ta:!!ta, form_len:form?form.innerHTML.length:-1,
-                        n_file_inputs:document.querySelectorAll('input[type=file]').length});
+                        n_file_inputs:document.querySelectorAll('input[type=file]').length,
+                        ta_parent_html_len: ta.parentElement?ta.parentElement.innerHTML.length:-1,
+                        ta_parent_has_input: ta.parentElement? !!ta.parentElement.querySelector('input[type=file]') : null,
+                        file_input_in_form: form? !!form.querySelector('input[type=file]') : null});
                 })()""")
                 # 最小 1x1 png
                 import base64 as _b64
