@@ -2669,7 +2669,14 @@ async def attach_probe(aid: str, _=Depends(auth)):
                 return {"ok": True, "before": info1, "after": info2,
                         "attach": bool(res)}
             except Exception as exc:  # noqa: BLE001
-                return {"ok": False, "error": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
+                # patch22g4d：失败时也带 before 现场（诊断信息不能被异常吞掉）
+                _before = ""
+                try:
+                    _before = info1  # noqa: F821
+                except Exception:
+                    pass
+                return {"ok": False, "before": _before,
+                        "error": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
 
     return await asyncio.to_thread(_probe)
 
