@@ -39,6 +39,7 @@ _UA = {"User-Agent": "Mozilla/5.0 (MangoDrive-consumer)"}
 _TOKEN_TTL = 48 * 3600
 _FAIL_BACKOFF_THRESHOLD = 5  # 连续 5 次才退避（生产实测 mesh 有单笔瞬时抖动，3 太敏感）
 _FAIL_BACKOFF_SECS = 1800
+_MESH_COOLDOWN_SECS = 1800   # patch22n：mesh login 连接类故障冷却（与备份退避同长）
 
 
 def _cfg() -> dict:
@@ -72,6 +73,7 @@ class MediaBackuper:
         self._chan: str | None = None      # 当前可用通道: "mesh" | "public"
         self._consecutive_fail = 0
         self._backoff_until = 0.0
+        self._mesh_dead_until = 0.0        # patch22n：mesh 探测失败冷却（连不上的通道不再每轮先撞 15s）
 
     # ---- 通道与鉴权 ----
     def _base(self, chan: str) -> str:
@@ -85,10 +87,16 @@ class MediaBackuper:
                               headers=_UA, timeout=15)
             data = r.json()
             if data.get("code") == 200:
+                if chan == "mesh":
+                    self._mesh_dead_until = 0.0  # 恢复，解除冷却
                 return data["data"]["token"]
             log.warning("【媒体备份】%s login 失败: %s", chan, str(data.get("message"))[:100])
         except Exception as exc:  # noqa: BLE001
             log.warning("【媒体备份】%s login 异常: %s", chan, str(exc)[:100])
+            if chan == "mesh" and self._mesh_dead_until < time.monotonic():
+                # 连接类故障冷却 30 分钟（期间排到遍历队尾，不阻塞 public 主路）
+                self._mesh_dead_until = time.monotonic() + _MESH_COOLDOWN_SECS
+                log.info("【媒体备份】mesh 通道进入 %.0f 分钟冷却", _MESH_COOLDOWN_SECS // 60)
         return None
 
     def _get_token(self) -> tuple[str | None, str]:
@@ -100,8 +108,19 @@ class MediaBackuper:
             now = time.monotonic()
             if self._token and now - self._token_at < _TOKEN_TTL:
                 return self._token, self._chan
-            order = ([self._chan] if self._chan else []) + \
+            # patch22n：通道遍历顺序——冷却中的通道一律排到最后（含 _chan 本身：
+            # mesh 健康转故障时 _chan 仍是 mesh，若不降级每轮仍先撞 15s 超时）。
+            # 冷却 30 分钟后自动复探：mesh 排回最前（静态首选，恢复即回到主位）。
+            chans = ([self._chan] if self._chan else []) + \
                     [x for x in ("mesh", "public") if x != self._chan]
+            now_mono = time.monotonic()
+            mesh_dead = now_mono < self._mesh_dead_until
+            if mesh_dead:
+                alive = [c for c in chans if c != "mesh"]
+                order = alive + ["mesh"]
+            else:
+                alive = [c for c in chans if c != "mesh"]
+                order = ["mesh"] + alive
             for chan in order:
                 tok = self._login(chan)
                 if tok:
