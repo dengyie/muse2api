@@ -235,6 +235,15 @@ class MuseGenerationError(RuntimeError):
 SUBMIT_STAGE = "submit"
 
 
+def _cb(cb, *args):
+    """patch22：引擎侧回调安全执行（app._generation_callback 的引擎内等价物）。"""
+    if cb:
+        try:
+            cb(*args)
+        except Exception:
+            pass
+
+
 def _stage_before(a: str, b: str) -> bool:
     """a 是否发生在 b（提交）之前；未知 stage 按提交后处理（fail-safe）。"""
     order = ("queued", "page_prep", "upload", SUBMIT_STAGE, "wait", "extract")
@@ -2285,7 +2294,7 @@ class MuseEngine:
         # 最多 2 次尝试，重试间隔随退避（2s），不掩盖首次失败的分类诊断。
         page_prep_tries = 2
         for prep_attempt in range(1, page_prep_tries + 1):
-            _generation_callback(on_stage, "page_prep")
+            _cb(on_stage, "page_prep")
             try:
                 self.ensure_page(cookies, expires, account_id=account_id)
                 break
@@ -2300,7 +2309,7 @@ class MuseEngine:
                 time.sleep(2.0 * prep_attempt)
         self.reset_thread(for_chat=False)
         self._scroll_bottom()
-        _generation_callback(on_stage, "upload")
+        _cb(on_stage, "upload")
         refs = list(reference_images or ([] if not reference_image else [reference_image]))
         upload = self._attach_images(refs) if refs else None
         if not refs:
@@ -2326,11 +2335,11 @@ class MuseEngine:
         base_user_cnt = self._user_count()
         if time.monotonic() >= deadline:
             raise MuseGenerationError("任务准备超时，已停止发送")
-        _generation_callback(on_stage, "submit")
+        _cb(on_stage, "submit")
         if self._send(prompt) not in ("clicked", "enter-sent"):
             raise MuseGenerationError("提示词发送未确认，已停止生成",
                                       code="send_unconfirmed", stage="submit", retryable=True)
-        _generation_callback(on_stage, "wait")
+        _cb(on_stage, "wait")
         os.makedirs(self.cfg.media_dir, exist_ok=True)
         # 页面若把刚上传的素材渲染成"结果"，按哈希识别出来并继续等待真正的成品
         while time.monotonic() < deadline:
@@ -2349,7 +2358,7 @@ class MuseEngine:
 
             data = mime = url = None
             selected_src = (att.get("vSrc") if expect == "video" else None) or att.get("src") or ""
-            _generation_callback(on_stage, "extract")
+            _cb(on_stage, "extract")
             try:
                 data, mime, url = self.extract_bytes(selected_src, expect=expect)
             except Exception:  # noqa: BLE001
