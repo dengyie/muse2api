@@ -2253,7 +2253,7 @@ class MuseEngine:
         # React 尚未把附件处理器挂到该 input 上），此时 setFileInputFiles 把
         # 文件设进无 handler 的 input，附件永远不出现（30s 超时假失败）。
         # 就绪判定 = composer root 内含 input[type=file] 且 root 内容非空。
-        _composer_ready_js = "(function(){" + _COMPOSER_ROOTS_JS + """
+        _composer_ready_js = "(function(){" + self._COMPOSER_ROOTS_JS + """
             var roots = __composerRoots();
             for (var r of roots) {
                 if (r && r.querySelector('input[type=file]') && r.innerHTML.length > 200) return true;
