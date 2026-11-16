@@ -52,7 +52,8 @@ from config import CFG
 from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
                     MAX_REFERENCE_IMAGES, MAX_REFERENCE_TOTAL_BYTES,
                     REFERENCE_MIME_EXT, MuseAuthError, MuseEngine, MuseGenerationError,
-                    MuseModelRefusalError, MuseSessionUnavailable, RefImageSafetyError, reference_kind)
+                    MuseModelRefusalError, MuseSessionUnavailable, RefImageSafetyError, reference_kind,
+                    _stage_before)  # patch22d: worker 失败落库/sweep 均调用；缺失即 NameError→僵尸 processing 任务
 from engine import MuseProxyError
 from store import Store, account_expiry, min_expiry
 from proxy import normalize_server, request_proxy_context, split_proxy_url
