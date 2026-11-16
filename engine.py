@@ -2170,15 +2170,18 @@ class MuseEngine:
     # 新版 muse 页面已没有 hatch-composer-placeholder-overlay，也不包 <form>：
     # 输入框所在容器是 textarea 往上第二层，附件的「Remove attachment」按钮在那里。
     # 旧结构（overlay / form）优先，新结构从 textarea 逐级向上找最近的一层。
+    # patch22g3：closest('form') 可能命中一个 React 空壳 form（线上实证
+    # form_len=0、composer 内容渲染在 form 外），此时必须回退逐级向上探索，
+    # 否则 composer root 是空壳 → 附件按钮永远数到 0（假性上传失败）。
     _COMPOSER_ROOTS_JS = """
         function __composerRoots(){
             var ov = document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');
             var legacy = ov ? (ov.closest('form') || ov.parentElement.parentElement.parentElement) : null;
-            if (legacy) return [legacy];
+            if (legacy && legacy.innerHTML.length > 100) return [legacy];
             var ta = document.querySelector('textarea');
             if (!ta) return [];
             var form = ta.closest('form');
-            if (form) return [form];
+            if (form && form.innerHTML.length > 100) return [form];
             var out = [], el = ta.parentElement;
             for (var i = 0; i < 4 && el && el !== document.body; i++) { out.push(el); el = el.parentElement; }
             return out;
