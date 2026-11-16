@@ -26,6 +26,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 from urllib.parse import quote
@@ -218,27 +219,50 @@ class MediaBackuper:
 
         delete_local=True 时本地副本会在备份校验通过后被删除，此后
         /v1/media/{name} 与 /v1/videos/{id}/content 必须回源 OpenList 取回，
-        否则任务记录里 url 指向的成品从此不可读（交付断链）。按备份日期目录
-        从新到旧查找，命中即返回字节；通道不可用/不存在返回 None。
+        否则任务记录里 url 指向的成品从此不可读（交付断链）。
+        patch22m：不再用固定 7 天窗口——备份目录按日期组织且远端不清理，
+        任务 url 是永久引用，窗口外的历史成品同样必须可回源。改为 fs/list
+        枚举 base 下全部日期目录、名称倒序（新→旧）逐日 fs/get。
+        失败计入既有 _note_fail 退避（与 scan_once 共享），通道故障时
+        后续请求快速返回 None，不为每次交付重付超时。
         """
         if not enabled() or not name or "/" in name or "\\" in name or ".." in name:
             return None
+        if self.in_backoff():
+            log.warning("【媒体回源】备份通道退避中，跳过回源 %s", name)
+            return None
         tok, chan = self._get_token()
         if not tok:
+            self._note_fail()
             return None
         base = _cfg()["base"]
-        # 当天起往回找 7 天（备份目录按日期组织）
-        import datetime
-        for off in range(7):
-            day = (datetime.date.today() - datetime.timedelta(days=off)).isoformat()
-            rel = f"{base}/{day}/{name}"
-            r = requests.post(self._base(chan) + "/api/fs/get",
-                              json={"path": rel},
+        try:
+            r = requests.post(self._base(chan) + "/api/fs/list",
+                              json={"path": base, "page": 1, "per_page": 0},
                               headers={**_UA, "Authorization": tok}, timeout=20)
+            data = r.json()
+        except Exception as exc:
+            log.warning("【媒体回源】列目录失败: %s", str(exc)[:100])
+            self._note_fail()
+            return None
+        if data.get("code") in (401, 403):
+            self._invalidate_token()
+            return None
+        if data.get("code") != 200:
+            self._note_fail()
+            return None
+        days = sorted(((c.get("name") or "") for c in (data.get("data") or {}).get("content") or []),
+                      reverse=True)
+        for day in days:
+            if not re.match(r"^\d{4}-\d{2}-\d{2}$", day):
+                continue  # 只认日期目录（.gitkeep 等杂物跳过）
             try:
+                r = requests.post(self._base(chan) + "/api/fs/get",
+                                  json={"path": f"{base}/{day}/{name}"},
+                                  headers={**_UA, "Authorization": tok}, timeout=20)
                 data = r.json()
             except Exception:
-                return None
+                continue
             if data.get("code") in (401, 403):
                 self._invalidate_token()
                 return None
@@ -249,10 +273,14 @@ class MediaBackuper:
                 continue
             try:
                 rr = requests.get(raw_url, headers=_UA, timeout=120)
-            except Exception:
+            except Exception as exc:
+                log.warning("【媒体回源】raw 下载失败 %s/%s: %s", day, name, str(exc)[:80])
+                self._note_fail()
                 return None
             if rr.status_code == 200 and rr.content:
+                self._note_ok()
                 return rr.content
+            self._note_fail()
             return None
         return None
 
