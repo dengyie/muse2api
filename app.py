@@ -1838,6 +1838,7 @@ async def create_video(req: VideoRequest, request: Request, _=Depends(auth),
             _q = (_acc or {}).get("quota") or {}
             store.update_task(task["id"], status="completed", progress=100, account=acc_id,
                               **timing.finish(),
+                              stage="completed",
                               url=vurl,
                               video={"url": vurl},
                               quota_snapshot={k: _q.get(k) for k in
