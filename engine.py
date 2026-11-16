@@ -2289,8 +2289,7 @@ class MuseEngine:
                 # file input、composer 按钮与 URL，用于定位 API 路径与 probe
                 # 直连的差异（probe 同序列 attach 1.3s 成功）。
                 try:
-                    _diag = self.page.js("""(function(){
-                        var ta = document.querySelector('textarea');
+                    _diag = self.page.js("""(function(){                        var ta = document.querySelector('textarea');
                         var form = ta ? ta.closest('form') : null;
                         return JSON.stringify({
                             url: location.href, ready: document.readyState,
@@ -2302,8 +2301,7 @@ class MuseEngine:
                             form_len: form ? form.innerHTML.length : 0
                         });
                     })()""") or "{}"
-                    import json as _dj
-                    log.warning("【上传确认失败现场】%s", _dj[:500])
+                    log.warning("【上传确认失败现场】%s", str(_diag)[:500])
                 except Exception as _ie:
                     log.warning("【上传确认失败现场】诊断采集失败: %s", str(_ie)[:120])
                 raise MuseGenerationError(
