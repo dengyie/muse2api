@@ -1825,6 +1825,12 @@ class MuseEngine:
         return bool(re.search(
             r"\.(?:webp|png|jpe?g|mp4|webm)|imagine_media|deliverable|"
             r"generated\s+.*image|verified\s+generated|artifact|"
+            # patch22j：muse 视频 I2V 的实测成功声明报法——模型先输出参数
+            # 验证报告（"Verified: 6.00 seconds, 144 frames, 24fps, 1248x704,
+            # native I2V only..."），媒体随后才渲染/挂载。task_2e001214291342ea911e
+            # 实证：此文本 75s 稳定即被 txt_stable 误判「仅文本无媒体」提前终止
+            # （实际视频仍在产出）。此类带参数的 Verified 报告必须当作进行中信号。
+            r"^Verified?:\s*\d|[0-9]+\s*frames?[, ]|[0-9]+\s*fps\b|"
             r"^(?:已(?:经)?(?:成功)?生成|生成好了|生成完毕|已完成|做好了)(?:[，。！\s]|$)|"
             r"(?:视频|影片|短片|图片|图像)[^。！？!?\n]{0,40}"
             r"(?:已(?:经)?(?:成功)?生成|生成(?:成功|好了|完毕|完成)|已(?:经)?完成|做好了)|"
