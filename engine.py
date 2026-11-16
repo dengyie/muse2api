@@ -2248,6 +2248,30 @@ class MuseEngine:
             return None
 
         self._clear_attachments()
+        # patch22g：composer 就绪门控——线上实证（patch22f 现场日志）DOM 可能
+        # 存在 textarea + input[type=file] 但 composer 容器为空（form_len=0，
+        # React 尚未把附件处理器挂到该 input 上），此时 setFileInputFiles 把
+        # 文件设进无 handler 的 input，附件永远不出现（30s 超时假失败）。
+        # 就绪判定 = composer root 内含 input[type=file] 且 root 内容非空。
+        _composer_ready_js = "(function(){" + _COMPOSER_ROOTS_JS + """
+            var roots = __composerRoots();
+            for (var r of roots) {
+                if (r && r.querySelector('input[type=file]') && r.innerHTML.length > 200) return true;
+            }
+            return false;
+        })()"""
+        _ready_deadline = time.monotonic() + 15.0
+        while time.monotonic() < _ready_deadline:
+            try:
+                if self.page.js(_composer_ready_js):
+                    break
+            except Exception:
+                pass
+            time.sleep(0.3)
+        else:
+            raise MuseGenerationError(
+                "上传控件未就绪（composer 容器为空），已停止生成",
+                code="composer_not_ready", stage="upload", retryable=True)
         # Snap Chromium cannot read the host's /tmp; profile_dir is shared with it.
         os.makedirs(self.cfg.profile_dir, exist_ok=True)
         upload_dir = tempfile.mkdtemp(prefix="muse2api-refs-", dir=self.cfg.profile_dir)
@@ -2272,6 +2296,7 @@ class MuseEngine:
             # A remove button proves attachment presence, not upstream processing success.
             deadline = time.monotonic() + 30.0
             attached_count = 0
+            _reset_at = {i: 0.0 for i in range(len(files))}  # patch22g：每文件上次重设时间
             while time.monotonic() < deadline:
                 attached_count = self.page.js(self._ATTACHED_COUNT_JS)
                 try:  # patch13(F15)：js 异常时返回 dict，int(dict) 会裸抛 TypeError
@@ -2280,6 +2305,22 @@ class MuseEngine:
                     n_att = 0
                 if n_att >= len(files):
                     break
+                # patch22g：附件 5s 未出现 → 重设文件（composer 可能刚完成挂载，
+                # 首次 setFileInputFiles 打在了无 handler 的 input 上；重设会用
+                # _FILE_INPUT_JS 现查现取，命中已挂载的真实 input）。最多每文件
+                # 每 5s 一次，不放大 CDP 流量。
+                now = time.monotonic()
+                for i in range(n_att, len(files)):
+                    if now - _reset_at[i] >= 5.0:
+                        _reset_at[i] = now
+                        try:
+                            path_i = os.path.join(
+                                upload_dir, "reference_%d%s"
+                                % (i + 1, REFERENCE_MIME_EXT.get(files[i][2], '.bin')))
+                            self._set_input_files([path_i])
+                        except Exception:
+                            pass
+                        break
                 time.sleep(0.3)
             else:
                 # patch22d：上传确认失败属提交前失败——带 stage/code/retryable，
