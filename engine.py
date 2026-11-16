@@ -2285,6 +2285,27 @@ class MuseEngine:
                 # patch22d：上传确认失败属提交前失败——带 stage/code/retryable，
                 # worker 据此落 safe_to_resubmit=True（重发零计费风险），并让
                 # app 层 attempt 链能按提交前失败语义处理。
+                # patch22f：失败现场取证（仅诊断日志，不含凭据）——page 状态、
+                # file input、composer 按钮与 URL，用于定位 API 路径与 probe
+                # 直连的差异（probe 同序列 attach 1.3s 成功）。
+                try:
+                    _diag = self.page.js("""(function(){
+                        var ta = document.querySelector('textarea');
+                        var form = ta ? ta.closest('form') : null;
+                        return JSON.stringify({
+                            url: location.href, ready: document.readyState,
+                            ta: !!ta,
+                            n_file_inputs: document.querySelectorAll('input[type=file]').length,
+                            remove_btns: Array.from((form||document.body).querySelectorAll('button[aria-label]'))
+                                .map(function(b){return b.getAttribute('aria-label');})
+                                .filter(function(a){return /remove|attachment/i.test(a||'');}),
+                            form_len: form ? form.innerHTML.length : 0
+                        });
+                    })()""") or "{}"
+                    import json as _dj
+                    log.warning("【上传确认失败现场】%s", _dj[:500])
+                except Exception as _ie:
+                    log.warning("【上传确认失败现场】诊断采集失败: %s", str(_ie)[:120])
                 raise MuseGenerationError(
                     f"参考素材上传未确认（{int(attached_count or 0)}/{len(files)}），已停止生成",
                     code="upload_unconfirmed", stage="upload", retryable=True)
