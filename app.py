@@ -2649,11 +2649,10 @@ async def attach_probe(aid: str, _=Depends(auth)):
                 })()""")
                 # 最小 1x1 png
                 import base64 as _b64
-                tiny = _b64.b64decode(
+                tiny = _b64.b64encode(_b64.b64decode(
                     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg"
-                    "YGBgAAAABQABh6FO1AAAAABJRU5ErkJggg==")
-                res = engine._attach_images([{
-                }] if False else ["data:image/png;base64," + tiny.decode()])
+                    "YGBgAAAABQABh6FO1AAAAABJRU5ErkJggg==")).decode()
+                res = engine._attach_images(["data:image/png;base64," + tiny])
                 info2 = page.js("""(function(){
                     var ta=document.querySelector('textarea');
                     var form=ta?ta.closest('form'):null;
