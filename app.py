@@ -1942,7 +1942,17 @@ def get_video_content(task_id: str, _=Depends(auth)):
         raise HTTPException(503, "native_video_unavailable")
     p = os.path.join(CFG.media_dir, name)
     if not os.path.isfile(p):
-        raise HTTPException(503, "native_video_unavailable")
+        # patch22k：同 get_media——备份删除本地副本后回源远端
+        data = MEDIA_BACKUPER.fetch_remote(name) if mediabak.enabled() else None
+        if data:
+            os.makedirs(CFG.media_dir, exist_ok=True)
+            try:
+                with open(p, "wb") as f:
+                    f.write(data)
+            except OSError:
+                return Response(content=data, media_type="video/mp4")
+        else:
+            raise HTTPException(503, "native_video_unavailable")
     return FileResponse(p, media_type="video/mp4")
 
 
@@ -2299,7 +2309,20 @@ def get_media(name: str):
         raise HTTPException(400, "非法文件名")
     p = os.path.join(CFG.media_dir, name)
     if not os.path.isfile(p):
-        raise HTTPException(404, "文件不存在")
+        # patch22k：本地副本已被 mediabak 备份删除（delete_local）时回源远端，
+        # 保证任务 url 指向的成品始终可读（交付不因备份断链）。
+        data = MEDIA_BACKUPER.fetch_remote(name) if mediabak.enabled() else None
+        if data:
+            os.makedirs(CFG.media_dir, exist_ok=True)
+            try:
+                with open(p, "wb") as f:
+                    f.write(data)
+                # 回写 mtime 为文件备份时刻附近无必要；直接重新暴露给备份链会再次
+                # 上传同名文件（远端已存在 → 校验通过 → 幂等 kept-verified），无害。
+            except OSError:
+                return Response(content=data, media_type="video/mp4")
+        else:
+            raise HTTPException(404, "文件不存在")
     return FileResponse(p)
 
 

@@ -213,6 +213,49 @@ class MediaBackuper:
         except Exception:  # noqa: BLE001
             return None
 
+    def fetch_remote(self, name: str) -> bytes | None:
+        """patch22k：按名回源已备份媒体（交付链兜底）。
+
+        delete_local=True 时本地副本会在备份校验通过后被删除，此后
+        /v1/media/{name} 与 /v1/videos/{id}/content 必须回源 OpenList 取回，
+        否则任务记录里 url 指向的成品从此不可读（交付断链）。按备份日期目录
+        从新到旧查找，命中即返回字节；通道不可用/不存在返回 None。
+        """
+        if not enabled() or not name or "/" in name or "\\" in name or ".." in name:
+            return None
+        tok, chan = self._get_token()
+        if not tok:
+            return None
+        base = _cfg()["base"]
+        # 当天起往回找 7 天（备份目录按日期组织）
+        import datetime
+        for off in range(7):
+            day = (datetime.date.today() - datetime.timedelta(days=off)).isoformat()
+            rel = f"{base}/{day}/{name}"
+            r = requests.post(self._base(chan) + "/api/fs/get",
+                              json={"path": rel},
+                              headers={**_UA, "Authorization": tok}, timeout=20)
+            try:
+                data = r.json()
+            except Exception:
+                return None
+            if data.get("code") in (401, 403):
+                self._invalidate_token()
+                return None
+            if data.get("code") != 200:
+                continue
+            raw_url = (data.get("data") or {}).get("raw_url") or ""
+            if not raw_url:
+                continue
+            try:
+                rr = requests.get(raw_url, headers=_UA, timeout=120)
+            except Exception:
+                return None
+            if rr.status_code == 200 and rr.content:
+                return rr.content
+            return None
+        return None
+
     def _remove_remote(self, tok: str, chan: str, dir_path: str, names: list[str]) -> bool:
         try:
             r = requests.post(self._base(chan) + "/api/fs/remove",
