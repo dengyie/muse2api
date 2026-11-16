@@ -1275,7 +1275,8 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
                     reference_image: str | None = None,
                     reference_images: list[str] | None = None,
-                    on_acquired=None, on_account=None, on_queue=None, on_error=None) -> tuple[dict, str | None]:
+                    on_acquired=None, on_account=None, on_queue=None, on_error=None,
+                    on_stage=None) -> tuple[dict, str | None]:
     if not any(a.get("enabled", True) and a.get("cookies") for a in store.accounts):
         raise MuseGenerationError("没有可用的生成账号，请检查账号池")
     # patch13(F1)：排队时限独立于生成时限——上游 1.6.11 引入 QueuePolicy，
@@ -1294,7 +1295,8 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                                       on_progress, reference_image, reference_images,
                                       on_acquired=on_acquired, on_account=on_account,
                                       on_queue=on_queue, on_error=on_error,
-                                      queued=queued, queue_timeout=queue_timeout)
+                                      queued=queued, queue_timeout=queue_timeout,
+                                      on_stage=on_stage)
     finally:
         GEN_LOCK.release()
 
@@ -1305,7 +1307,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                     reference_images: list[str] | None = None,
                     deadline=None, on_acquired=None, on_account=None,
                     on_queue=None, on_error=None, queued=0.0,
-                    queue_timeout=None) -> tuple[dict, str | None]:
+                    queue_timeout=None, on_stage=None) -> tuple[dict, str | None]:
     if queue_timeout is None:
         queue_timeout = QUEUE_POLICY.settings()["queue_timeout"]
 
@@ -1393,6 +1395,9 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 # 付费生成，失败/超时/取消同样要计入 attempt（原「成功后才入账」
                 # 漏记重发那次，现场实证 task_bb4cb 2 次付费只记 1 次）。
                 _generation_callback(on_acquired)
+                # patch22：stage 回调透传——video worker 据此落库失败环节
+                if on_stage:
+                    engine_kwargs["on_stage"] = on_stage
                 res = engine.generate(cur_acc["cookies"], prompt, expect=kind,
                                       timeout=remaining, expires=cur_acc.get("cookies_exp"),
                                       account_id=cur_acc["id"], on_progress=on_progress,
@@ -1773,7 +1778,14 @@ async def create_video(req: VideoRequest, request: Request, _=Depends(auth),
                         raise HTTPException(409, "Idempotency-Key reused with different request (existing task: %s)" % existing["id"])
                     # patch14(F4)：failed 任务不算幂等命中——同 key 重放允许重建
                     # （失败后清索引可能因竞态漏掉，这里双保险）。
+                    # patch22：仅限 safe_to_resubmit=True（提交前失败，可证上游
+                    # 无任务）——提交后失败/结果未知一律返回原任务，禁止自动重放。
                     if existing.get("status") == "failed":
+                        if existing.get("safe_to_resubmit") is False:
+                            return {"id": existing["id"], "task_id": existing["id"],
+                                    "object": "video.task", "status": existing["status"],
+                                    "progress": existing.get("progress", 0),
+                                    "created_at": existing["created_at"]}
                         continue
                     return {"id": existing["id"], "task_id": existing["id"],
                             "object": "video.task", "status": existing["status"],
@@ -1816,7 +1828,9 @@ async def create_video(req: VideoRequest, request: Request, _=Depends(auth),
             res, acc_id = _run_generation(prompt, "video", timeout, on_progress=prog_cb,
                                           reference_images=ref_images, on_acquired=_on_acquired,
                                           on_account=timing.account,
-                                          on_queue=timing.queued, on_error=timing.error)
+                                          on_queue=timing.queued, on_error=timing.error,
+                                          on_stage=lambda s: store.update_task(
+                                              task["id"], stage=s))
             vurl = media_url(res["filename"])
             # patch16：token 关联账——终态记录该账号当时最近一次 quota 快照
             # （weekly_used_pct / extra_left），跨任务差分即得消耗趋势。
@@ -1842,22 +1856,35 @@ async def create_video(req: VideoRequest, request: Request, _=Depends(auth),
             # retryable：发送层失败（换号重试有意义）；附件失效/上游不可用不安全重试
             retryable = getattr(exc, "code", "") not in (
                 "upstream_attachment_broken", "native_video_unavailable")
+            # patch22：失败环节与提交安全性——stage < submit 证明上游未收到
+            # 任何生成请求（重发零计费风险）；stage >= submit 的失败上游结果
+            # 未知，generation_accepted 必须记 unknown，禁止调用方自动重放。
+            fail_stage = getattr(exc, "stage", "") or (task.get("stage") or "queued")
+            exc_retryable = getattr(exc, "retryable", None)
+            if exc_retryable is not None:
+                retryable = bool(exc_retryable) and retryable
+            safe_to_resubmit = _stage_before(fail_stage, "submit")
             _acc = store.get_account(acc_id) if acc_id else None
             _q = (_acc or {}).get("quota") or {}
             store.update_task(task["id"], status="failed",
                               **timing.finish(),
                               error=_err_detail(exc),
                               error_code=getattr(exc, "code", "") or "generation_failed",
+                              stage=fail_stage,
+                              generation_accepted=("unknown" if not safe_to_resubmit
+                                                   else "no"),
+                              safe_to_resubmit=safe_to_resubmit,
                               generation_attempts=attempts["n"],
                               attempt_events=list(attempts["events"]),
                               retryable=retryable,
                               quota_snapshot={k: _q.get(k) for k in
                                               ("plan", "weekly_used_pct", "extra_left",
                                                "extra_used_pct", "checked_at")} if _q else None)  # patch16
-            # patch14(F4)：失败即清幂等索引——同 key 重放可重建，不让
-            # failed 旧任务挡死自愈路径（task 兜底查另有 failed 跳过双保险）。
+            # patch14(F4)+patch22：失败清幂等索引只对「提交前失败」生效（
+            # safe_to_resubmit=True）——提交后失败的上游结果未知，同 key 重放
+            # 不得静默重建；调用方拿到带 stage/safe_to_resubmit 的失败任务自行决策。
             vh = task.get("video_request_key")
-            if vh:
+            if vh and safe_to_resubmit:
                 with VIDEO_TASK_LOCK:
                     idx = IDEMPOTENCY_VIDEOS.get(vh)
                     if idx and idx.get("task_id") == task["id"]:
@@ -3414,12 +3441,20 @@ async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
 async def _startup():
     for task in list(store.tasks.values()):
         if task.get("kind") in ("image", "video") and task.get("status") in ("queued", "processing"):
-            store.update_task(task["id"], status="failed", error="服务重启中断了任务，请重新提交")
-            # patch19：sweep 也是失败——同步清幂等索引，不让重启中断的
-            # 任务留下失效索引项（对齐 patch14 失败即清语义）。
+            sweep_stage = task.get("stage") or "queued"
+            interrupted_safe = _stage_before(sweep_stage, "submit")
+            store.update_task(task["id"], status="failed",
+                              error="服务重启中断了任务，请重新提交",
+                              # patch22：提交后中断的上游结果未知——不许自动重放
+                              generation_accepted=("no" if interrupted_safe else "unknown"),
+                              safe_to_resubmit=interrupted_safe)
+            # patch19+patch22：sweep 清幂等索引只对「提交前中断」生效；
+            # 提交后中断保留索引（同 key 重放拿到带 safe_to_resubmit=False
+            # 的失败任务，由调用方决策），24h TTL 兜底防陈旧项。
             with VIDEO_TASK_LOCK:
                 kh = task.get("video_request_key")
-                if kh and IDEMPOTENCY_VIDEOS.get(kh, {}).get("task_id") == task["id"]:
+                if (kh and interrupted_safe
+                        and IDEMPOTENCY_VIDEOS.get(kh, {}).get("task_id") == task["id"]):
                     IDEMPOTENCY_VIDEOS.pop(kh, None)
     if not CFG.api_key:
         import secrets
@@ -3472,6 +3507,67 @@ async def _tetherpool_heartbeat():
 @app.get("/admin/tetherpool/status")
 def tetherpool_status(_=Depends(auth)):
     return TP.status()
+
+
+# ---------------- patch22：历史提交按幂等键/request hash 查询 ----------------
+def _submission_view(t: dict) -> dict:
+    """公开任务↔原生任务映射 + 重放安全性的单一视图（排障/Agent 契约）。"""
+    return {
+        "task_id": t.get("id"),
+        "status": t.get("status"),
+        "stage": t.get("stage", ""),
+        "error_code": t.get("error_code", ""),
+        "error": t.get("error", ""),
+        "retryable": t.get("retryable"),
+        "generation_accepted": t.get("generation_accepted", ""),
+        "safe_to_resubmit": t.get("safe_to_resubmit"),
+        "created_at": t.get("created_at"),
+        "video_request_key": t.get("video_request_key", ""),
+        "video_request_hash": t.get("video_request_hash", ""),
+    }
+
+
+@app.get("/admin/videos/idempotency/{key_hash}")
+def admin_video_by_key(key_hash: str, _=Depends(auth)):
+    """按 Idempotency-Key 的 sha256（key_hash）查询原提交。
+
+    返回索引命中 + task 兜底扫描的合并结果；绝不清理冲突记录。
+    key_hash = sha256(Idempotency-Key 原文)（与写入路径同算法）。"""
+    with VIDEO_TASK_LOCK:
+        idx = dict(IDEMPOTENCY_VIDEOS.get(key_hash) or {})
+    hits = []
+    seen = set()
+    if idx.get("task_id"):
+        t = store.get_task(idx["task_id"])
+        if t:
+            hits.append(_submission_view(t))
+            seen.add(t["id"])
+    for t in store.tasks.values():
+        if t.get("kind") == "video" and t.get("video_request_key") == key_hash \
+                and t["id"] not in seen:
+            hits.append(_submission_view(t))
+            seen.add(t["id"])
+    return {"key_hash": key_hash, "in_index": bool(idx),
+            "request_hash": idx.get("request_hash", ""),
+            "matches": hits}
+
+
+@app.get("/admin/videos/by-request-hash/{request_hash}")
+def admin_video_by_hash(request_hash: str, _=Depends(auth)):
+    """按请求体 hash（sha256(JSON(req.model_dump()+归一化参考图))）查询原提交。"""
+    hits = [_submission_view(t) for t in store.tasks.values()
+            if t.get("kind") == "video" and t.get("video_request_hash") == request_hash]
+    return {"request_hash": request_hash, "matches": hits}
+
+
+@app.get("/admin/videos/by-public/{public_task_id}")
+def admin_video_by_public(public_task_id: str, _=Depends(auth)):
+    """按调用方（网关）公开任务 ID 直查本地任务——网关侧存有
+    upstream_task_id 映射时，用本端点还原完整链路（OpenPet 排障契约）。"""
+    t = store.get_task(public_task_id)
+    if not t or t.get("kind") != "video":
+        raise HTTPException(404, "task 不存在")
+    return _submission_view(t)
 
 
 @app.post("/admin/accounts/{aid}/tetherpool/rebind")

@@ -215,11 +215,30 @@ class MuseAuthError(RuntimeError):
 
 
 class MuseGenerationError(RuntimeError):
-    """生成失败。.code 为机器可读错误码（OpenPet Agent 契约封闭集合）。"""
+    """生成失败。.code 为机器可读错误码（OpenPet Agent 契约封闭集合）。
 
-    def __init__(self, msg: str, code: str = "generation_failed"):
+    patch22：可选 .stage（失败环节）与 .retryable（重试安全性）——
+    stage < submit 的失败发生在消息提交前，重发不会重复计费；
+    stage >= submit 的失败上游结果未知，safe_to_resubmit 必须为 False。
+    """
+
+    def __init__(self, msg: str, code: str = "generation_failed",
+                 stage: str = "", retryable: bool | None = None):
         super().__init__(msg)
         self.code = code
+        self.stage = stage
+        self.retryable = retryable
+
+
+# patch22：失败环节封闭集合（随错误一起落库，供 Agent 判定 safe_to_resubmit）。
+# 顺序即流水线序：queued < page_prep < upload < submit < wait < extract。
+SUBMIT_STAGE = "submit"
+
+
+def _stage_before(a: str, b: str) -> bool:
+    """a 是否发生在 b（提交）之前；未知 stage 按提交后处理（fail-safe）。"""
+    order = ("queued", "page_prep", "upload", SUBMIT_STAGE, "wait", "extract")
+    return a in order and b in order and order.index(a) < order.index(b)
 
 
 class MuseProxyError(MuseGenerationError):
@@ -1084,20 +1103,56 @@ class MuseEngine:
         if self._wait_ws_ready(page, timeout=self.cfg.login_wait):
             self.current_acc_id = account_id
             return page
+        # patch22：页面准备失败必须产出可核对的分类证据（最终 URL / 就绪状态 /
+        # 输入框 / 登录标记 / 代理标记），而不是一句笼统的超时。
+        # 所有诊断均来自页面 DOM 文本，不含 cookie/凭据。
         try:
-            body = (page.js("document.body ? document.body.innerText.slice(0,1200) : ''") or "").lower()
+            diag = page.js("""(function(){
+                var h = document.querySelector('[data-hatch-shell-hydration-state]');
+                return JSON.stringify({
+                    url: location.href,
+                    ready: document.readyState,
+                    ta: !!document.querySelector('textarea'),
+                    hydration: h ? h.getAttribute('data-hatch-shell-hydration-state') : '',
+                    markers: (document.body ? document.body.innerText : '')
+                        .slice(0, 600)
+                });
+            })()""") or "{}"
+            import json as _json
+            d = _json.loads(diag)
         except Exception:
-            body = ""
+            d = {"url": "", "ready": "", "ta": False, "hydration": "", "markers": ""}
+        body = (d.get("markers") or "").lower()
+        url_now = d.get("url") or ""
+        log.warning("【页面准备失败】account=%s url=%s ready=%s textarea=%s hydration=%s markers=%r",
+                    account_id, url_now[:120], d.get("ready"), d.get("ta"),
+                    d.get("hydration"), body[:200].replace("\n", " "))
         self._close_page()
-        if proxy and re.search(r"err_(?:proxy|tunnel)|proxy authentication|代理认证失败", body, re.I):
-            raise MuseProxyError("账号代理浏览器连接失败，请检查节点或认证；未回退直连")
+        if proxy and re.search(r"err_(?:proxy|tunnel)|proxy authentication|代理认证失败", body):
+            raise MuseProxyError(
+                "账号代理浏览器连接失败，请检查节点或认证；未回退直连",
+                code="proxy_error", stage="page_prep", retryable=True)
         if "connecting..." in body:
-            raise MuseGenerationError("页面网关连接超时 (Connecting...)，正在自动切换账号")
+            raise MuseGenerationError(
+                "页面网关连接超时 (Connecting...)，正在自动切换账号",
+                code="gateway_connecting_timeout", stage="page_prep", retryable=True)
         # Distinguish an expired session from a page that never became ready.
         if re.search(r"log in|sign in|create an account|登录|use another account", body):
             raise MuseAuthError("会话已被 muse.ai 登出（可能被其它登录挤掉或触发风控），"
-                                "请用浏览器扩展重新导入 cookie")
-        raise MuseGenerationError("muse.ai 页面加载超时（未出现聊天输入框），请检查服务器网络后重试；未确认会话失效")
+                                "请用浏览器扩展重新导入 cookie；未提交任何生成请求")
+        # patch22：带证据的超时分类——不是账号失效，也不是会话失效。
+        hint = []
+        if not d.get("ready") or d.get("ready") != "complete":
+            hint.append("主文档未完成加载")
+        if not d.get("ta"):
+            hint.append("输入框未渲染")
+        if d.get("hydration") and d.get("hydration") != "hydrated":
+            hint.append("前端未完成 hydration(%s)" % d.get("hydration"))
+        raise MuseGenerationError(
+            "muse.ai 页面加载超时（未出现聊天输入框）：%s；"
+            "最终 URL=%s，未确认会话失效，未提交任何生成请求"
+            % ("、".join(hint) or "页面就绪条件未满足", url_now[:100] or "unknown"),
+            code="page_prep_timeout", stage="page_prep", retryable=True)
 
     def close_current_page(self):
         """显式释放当前线程所持有的页面和隔离上下文。"""
@@ -1618,7 +1673,7 @@ class MuseEngine:
             # patch13(F24)：额度检查上移——额度耗尽可能同时满足「气泡已现 +
             # 附件未挂载」，先于 L3 判定避免坏账账号被误归因 attachment_broken。
             if re.search(r"额度不足|积分不足|out of credits|达到上限|token limit", tail, re.I):
-                raise MuseGenerationError("账号额度不足")
+                raise MuseGenerationError("账号额度不足", code="quota_exhausted", stage="wait", retryable=False)
             if has_upload and elapsed > 25.0 and cur_cnt == base_agent_cnt:
                 if not user_bubble_seen:
                     # L2 发送层未送达：用户气泡从未出现 = 消息没提交。
@@ -2223,24 +2278,44 @@ class MuseEngine:
                  timeout: int = 240, expires: dict | None = None, account_id: str | None = None,
                  on_progress=None, reference_image: str | None = None,
                  reference_images: list[str] | None = None,
-                 stop_event=None) -> dict:
+                 stop_event=None, on_stage=None) -> dict:
         deadline = time.monotonic() + timeout
-        self.ensure_page(cookies, expires, account_id=account_id)
+        # patch22：页面准备的有界重试——只重试 stage=page_prep（消息必然尚未
+        # 提交、参考图尚未上传，重试零计费风险）；auth 属终态不重试。
+        # 最多 2 次尝试，重试间隔随退避（2s），不掩盖首次失败的分类诊断。
+        page_prep_tries = 2
+        for prep_attempt in range(1, page_prep_tries + 1):
+            _generation_callback(on_stage, "page_prep")
+            try:
+                self.ensure_page(cookies, expires, account_id=account_id)
+                break
+            except MuseAuthError:
+                raise
+            except MuseGenerationError as exc:
+                if (prep_attempt >= page_prep_tries
+                        or getattr(exc, "stage", "") != "page_prep"):
+                    raise
+                log.warning("【页面准备重试】第 %d/%d 次失败（%s），退避后重开页面",
+                            prep_attempt, page_prep_tries, str(exc)[:80])
+                time.sleep(2.0 * prep_attempt)
         self.reset_thread(for_chat=False)
         self._scroll_bottom()
+        _generation_callback(on_stage, "upload")
         refs = list(reference_images or ([] if not reference_image else [reference_image]))
         upload = self._attach_images(refs) if refs else None
         if not refs:
             self._clear_attachments()
         try:
             return self._generate_attached(prompt, expect, deadline, on_progress,
-                                           stop_event, (upload or {}).get("hashes") or set())
+                                           stop_event, (upload or {}).get("hashes") or set(),
+                                           on_stage=on_stage)
         finally:
             if upload:
                 shutil.rmtree(upload["dir"], ignore_errors=True)
 
     def _generate_attached(self, prompt: str, expect: str, deadline: float,
-                           on_progress, stop_event, upload_hashes: set) -> dict:
+                           on_progress, stop_event, upload_hashes: set,
+                           on_stage=None) -> dict:
         atts_before = self.attachments()
         baseline_sources = {a.get(k) for a in atts_before for k in ("src", "vSrc", "iSrc") if a.get(k)}
         base = atts_before[-1] if atts_before else {}
@@ -2251,8 +2326,11 @@ class MuseEngine:
         base_user_cnt = self._user_count()
         if time.monotonic() >= deadline:
             raise MuseGenerationError("任务准备超时，已停止发送")
+        _generation_callback(on_stage, "submit")
         if self._send(prompt) not in ("clicked", "enter-sent"):
-            raise MuseGenerationError("提示词发送未确认，已停止生成")
+            raise MuseGenerationError("提示词发送未确认，已停止生成",
+                                      code="send_unconfirmed", stage="submit", retryable=True)
+        _generation_callback(on_stage, "wait")
         os.makedirs(self.cfg.media_dir, exist_ok=True)
         # 页面若把刚上传的素材渲染成"结果"，按哈希识别出来并继续等待真正的成品
         while time.monotonic() < deadline:
@@ -2267,10 +2345,11 @@ class MuseEngine:
             )
             if not att:
                 self._debug_dump("no-attachment")
-                raise MuseGenerationError("等待生成超时，未出现新的生成结果")
+                raise MuseGenerationError("等待生成超时，未出现新的生成结果", code="generation_wait_timeout", stage="wait", retryable=False)
 
             data = mime = url = None
             selected_src = (att.get("vSrc") if expect == "video" else None) or att.get("src") or ""
+            _generation_callback(on_stage, "extract")
             try:
                 data, mime, url = self.extract_bytes(selected_src, expect=expect)
             except Exception:  # noqa: BLE001
@@ -2299,7 +2378,7 @@ class MuseEngine:
 
             path = self._download_fallback(selected_src)
             if not path:
-                raise MuseGenerationError("已生成但未能取回文件")
+                raise MuseGenerationError("已生成但未能取回文件", code="media_extract_failed", stage="extract", retryable=False)
             with open(path, "rb") as f:
                 digest = hashlib.sha256(f.read()).hexdigest()
             if digest in upload_hashes:
@@ -2327,7 +2406,7 @@ class MuseEngine:
                     "kind": kind,
                     "via": "download", "attachment": att.get("tid"),
                     "w": att.get("w"), "h": att.get("h")}
-        raise MuseGenerationError("页面只返回了本次上传的参考素材，未出现新的生成结果")
+        raise MuseGenerationError("页面只返回了本次上传的参考素材，未出现新的生成结果", code="no_native_media", stage="wait", retryable=False)
 
     # patch9：出片核验——容器魔数 + 最小体积 + expect 匹配。
     # 拦截上游静默替换参数/交付坏容器（HTML 错误页、零字节、图片冒充视频等）。
