@@ -2626,6 +2626,50 @@ async def test_account(aid: str, _=Depends(auth)):
     return res
 
 
+@app.post("/admin/accounts/{aid}/attach-probe")
+async def attach_probe(aid: str, _=Depends(auth)):
+    """patch22 诊断：在 API 进程内对运行引擎执行真实 attach 测试（1KB 测试 PNG），
+    返回 composer 现场——用于定位 API 路径 attach 失败而外部 probe 成功的差异。"""
+    acc = store.get_account(aid)
+    if not acc:
+        raise HTTPException(404, "账号不存在")
+
+    def _probe():
+        with GEN_LOCK, _account_operation(aid) as acc:
+            try:
+                engine.start()
+                page = engine.ensure_page(acc["cookies"], acc.get("cookies_exp"),
+                                          account_id=aid)
+                info1 = page.js("""(function(){
+                    var ta=document.querySelector('textarea');
+                    var form=ta?ta.closest('form'):null;
+                    return JSON.stringify({url:location.href, ready:document.readyState,
+                        ta:!!ta, form_len:form?form.innerHTML.length:-1,
+                        n_file_inputs:document.querySelectorAll('input[type=file]').length});
+                })()""")
+                # 最小 1x1 png
+                import base64 as _b64
+                tiny = _b64.b64decode(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg"
+                    "YGBgAAAABQABh6FO1AAAAABJRU5ErkJggg==")
+                res = engine._attach_images([{
+                }] if False else ["data:image/png;base64," + tiny.decode()])
+                info2 = page.js("""(function(){
+                    var ta=document.querySelector('textarea');
+                    var form=ta?ta.closest('form'):null;
+                    return JSON.stringify({form_len:form?form.innerHTML.length:-1,
+                        remove_btns:Array.from(document.querySelectorAll('button[aria-label]'))
+                            .map(function(b){return b.getAttribute('aria-label');})
+                            .filter(function(a){return /remove|attachment/i.test(a||'');})});
+                })()""")
+                return {"ok": True, "before": info1, "after": info2,
+                        "attach": bool(res)}
+            except Exception as exc:  # noqa: BLE001
+                return {"ok": False, "error": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
+
+    return await asyncio.to_thread(_probe)
+
+
 @app.post("/admin/accounts/{aid}/relogin")
 async def relogin_account(aid: str, _=Depends(auth)):
     return await test_account(aid, _)
