@@ -220,13 +220,15 @@ def _read(path: str, default):
 
 def _write(path: str, obj):
     """原子写 + fsync（patch22r）：os.replace 原子性 + 强制刷盘，掉电场景
-    终态/幂等/归档记录不丢（对齐 QueuePolicy.save 的持久化标准）。"""
+    终态/幂等/归档记录不丢（对齐 QueuePolicy.save 的持久化标准）。
+    patch22r-final：紧凑序列化——indent=1 占 ~32% 体积（tasks.json 442KB→~300KB），
+    tasks/归档/幂等/账号全部写路径受益；文件只被本服务读写（人读用 python -m json.tool）。"""
     d = os.path.dirname(path)
     os.makedirs(d, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=d)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False, indent=1)
+            json.dump(obj, f, ensure_ascii=False, separators=(",", ":"))
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
@@ -249,6 +251,8 @@ class Store:
         # 无主文件」，取证只能靠时间窗猜（2026-11-18 OpenPet 409 取证实证断链）。
         # 索引随任务完成时写入，随 delete_media 删除，永不随 prune 蒸发。
         self.archive_index: dict[str, dict] = _read(cfg.archive_index_file, {})
+        # patch22r-final：tasks 落盘节流时间戳（monotonic；0 = 尚未写过）
+        self._last_tasks_flush = 0.0
 
     # ---------- 账号 ----------
     def add_account(self, cookies: dict, label: str = "",
@@ -560,6 +564,27 @@ class Store:
             _write(self.cfg.tasks_file, self.tasks)
             return t
 
+    # patch22r-final：进度类更新的落盘节流窗口（秒）。非终态轻量更新在此窗口
+    # 内只改内存不写盘，下一个超出窗口的更新或任何 create/delete/prune 落盘
+    # 时捎带——崩溃窗口 ≤ 节流窗口，progress 回退对 sweep 语义无影响
+    # （中断判定只看 status/stage，不看 progress）。证据：线上 183 笔 × ~15
+    # 次生命周期更新 × 442KB ≈ 1.2GB 累计写/3 天，其中进度类占大头。
+    TASK_FLUSH_THROTTLE = 2.0
+    _TERMINAL_STATUS = ("completed", "failed", "succeeded", "success", "done", "cancelled")
+
+    @classmethod
+    def _is_progress_only(cls, kw: dict) -> bool:
+        return bool(kw) and all(k in ("progress", "stage", "attempt_events",
+                                      "generation_attempts", "quota_snapshot")
+                                for k in kw)
+
+    def _flush_tasks_if_due_locked(self, force: bool):
+        """节流落盘：force（终态/结构性变更）立即写；进度类在窗口内合并。"""
+        now = time.monotonic()
+        if force or now - self._last_tasks_flush >= self.TASK_FLUSH_THROTTLE:
+            _write(self.cfg.tasks_file, self.tasks)
+            self._last_tasks_flush = now
+
     def update_task(self, tid: str, **kw):
         with _LOCK:
             t = self.tasks.get(tid)
@@ -567,15 +592,41 @@ class Store:
                 return None
             t.update(kw)
             t["updated_at"] = int(time.time())
+            terminal = (t.get("status") or "").startswith(self._TERMINAL_STATUS)
             # patch22o：任务带成品落终态时同步归档索引（不依赖被裁才补写）
-            if (t.get("status") or "").startswith(("completed", "failed")) \
-                    and ((t.get("result") or {}).get("filename")
-                         or (t.get("result") or {}).get("url")):
+            if terminal and ((t.get("result") or {}).get("filename")
+                             or (t.get("result") or {}).get("url")):
                 self._archive_snapshot_locked(tid, t)
                 self._write_archive_index_locked()
             self._prune_tasks_locked()
-            _write(self.cfg.tasks_file, self.tasks)
+            # patch22r-final：进度类非终态更新节流落盘（写合并）；终态/含
+            # 幂等键/归档/结构性字段立即落盘（恢复语义依赖它们的持久性）
+            force = (not self._is_progress_only(kw)) or terminal
+            self._flush_tasks_if_due_locked(force)
             return t
+
+    def update_tasks_bulk(self, items: list[tuple[str, dict]]) -> int:
+        """patch22r-final：批量更新 + 单次落盘——startup sweep 等批处理路径
+        专用。原 sweep 对每个中断任务各调一次 update_task = N 次全量重写
+        （92 任务 × 442KB ≈ 40MB 串行写 + event loop 阻塞秒级）。"""
+        n = 0
+        with _LOCK:
+            for tid, kw in items:
+                t = self.tasks.get(tid)
+                if not t:
+                    continue
+                t.update(kw)
+                t["updated_at"] = int(time.time())
+                terminal = (t.get("status") or "").startswith(self._TERMINAL_STATUS)
+                if terminal and ((t.get("result") or {}).get("filename")
+                                 or (t.get("result") or {}).get("url")):
+                    self._archive_snapshot_locked(tid, t)
+                n += 1
+            self._write_archive_index_locked()
+            self._prune_tasks_locked()
+            _write(self.cfg.tasks_file, self.tasks)
+            self._last_tasks_flush = time.monotonic()
+        return n
 
     def get_task(self, tid: str) -> dict | None:
         return self.tasks.get(tid)

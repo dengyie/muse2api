@@ -521,5 +521,74 @@ def test_start_probe_rebuild():
 
 test_start_probe_rebuild()
 
+
+# ---------------- 17. 写放大优化（patch22r-final，日志证据驱动） ----------------
+from config import Config as _C3  # noqa: E402
+
+c4 = _C3(); c4.base_dir = os.path.join(TMP, "d-throttle"); c4.ensure_dirs()
+s4 = store_mod.Store(c4)
+
+writes = []
+orig_w = store_mod._write
+store_mod._write = lambda p, o: (writes.append(os.path.basename(p)),
+                                 orig_w(p, o))
+try:
+    ta = s4.create_task("video", "sanitized")
+    s4.update_task(ta["id"], video_request_key="kt", video_request_hash="ht")
+    writes.clear()
+    # 进度类连续 5 次更新（2s 节流窗口内）→ 只允许 1 次落盘
+    for p in (10, 15, 25, 40, 50):
+        s4.update_task(ta["id"], progress=p)
+    tasks_writes = [f for f in writes if f == "tasks.json"]
+    check("progress updates coalesced under throttle",
+          len(tasks_writes) <= 1, len(tasks_writes))
+    # 终态强制落盘（即使窗口内）
+    s4.update_task(ta["id"], status="completed", progress=100,
+                   result={"filename": "t.mp4", "bytes": 1, "kind": "video"})
+    check("terminal update forces flush",
+          "tasks.json" in writes)
+    disk_tasks = store_mod._read(c4.tasks_file, {})
+    check("terminal state persisted",
+          disk_tasks.get(ta["id"], {}).get("status") == "completed")
+finally:
+    store_mod._write = orig_w
+
+# 批量更新：N 任务单次落盘
+writes.clear()
+store_mod._write = lambda p, o: (writes.append(os.path.basename(p)),
+                                 orig_w(p, o))
+try:
+    items = []
+    for i in range(6):
+        tbi = s4.create_task("video", "sanitized")
+        items.append((tbi["id"], {"status": "failed",
+                                  "error": "x",
+                                  "safe_to_resubmit": True}))
+    writes.clear()
+    n = s4.update_tasks_bulk(items)
+    check("bulk updates applied", n == 6, n)
+    check("bulk flushes once", len([f for f in writes if f == "tasks.json"]) == 1,
+          len(writes))
+    disk_tasks = store_mod._read(c4.tasks_file, {})
+    check("bulk states persisted", all(
+        disk_tasks.get(tid, {}).get("status") == "failed" for tid, _ in items))
+finally:
+    store_mod._write = orig_w
+
+# 紧凑序列化：体积对比
+obj = {"k%d" % i: {"a": "value-%d" % i, "b": [1, 2, 3]} for i in range(50)}
+p1 = os.path.join(TMP, "c1.json"); p2 = os.path.join(TMP, "c2.json")
+store_mod._write(p1, obj)
+with open(p1, "rb") as f:
+    compact = f.read()
+with open(p2, "w", encoding="utf-8") as f:
+    store_mod.json.dump(obj, f, ensure_ascii=False, indent=1)
+    f.flush()
+with open(p2, "rb") as f:
+    indented = f.read()
+check("compact serialization smaller", len(compact) < len(indented),
+      (len(compact), len(indented)))
+check("compact still loadable", store_mod._read(p1, None) == obj)
+
 print("\nPASSED %d  FAILED %d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

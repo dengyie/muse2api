@@ -3551,22 +3551,34 @@ async def _startup():
     # patch22r：双域幂等索引从磁盘恢复（TTL 外项丢弃；写路径已带 purge）
     IDEMPOTENCY_VIDEOS.load()
     IDEMPOTENCY_IMAGES.load()
+    # patch22r-final：sweep 批量化——原对每个中断任务各调一次 update_task
+    # （N 次 442KB 全量重写 + event loop 阻塞秒级）；改收集后单次批量落盘。
+    sweep_items = []
+    sweep_keys = []
     for task in list(store.tasks.values()):
         if task.get("kind") in ("image", "video") and task.get("status") in ("queued", "processing"):
             sweep_stage = task.get("stage") or "queued"
             interrupted_safe = _stage_before(sweep_stage, "submit")
-            store.update_task(task["id"], status="failed",
-                              error="服务重启中断了任务，请重新提交",
-                              # patch22：提交后中断的上游结果未知——不许自动重放
-                              generation_accepted=("no" if interrupted_safe else "unknown"),
-                              safe_to_resubmit=interrupted_safe)
+            sweep_items.append((task["id"], {
+                "status": "failed",
+                "error": "服务重启中断了任务，请重新提交",
+                # patch22：提交后中断的上游结果未知——不许自动重放
+                "generation_accepted": ("no" if interrupted_safe else "unknown"),
+                "safe_to_resubmit": interrupted_safe,
+            }))
             # patch19+patch22：sweep 清幂等索引只对「提交前中断」生效；
             # 提交后中断保留索引（同 key 重放拿到带 safe_to_resubmit=False
             # 的失败任务，由调用方决策），24h TTL 兜底防陈旧项。
+            if interrupted_safe:
+                sweep_keys.append((task.get("video_request_key"), task["id"]))
+    if sweep_items:
+        n = store.update_tasks_bulk(sweep_items)
+        log.info("【启动 sweep】%d 个中断任务批量落盘（safe=%d）",
+                 n, len(sweep_keys))
+    for kh, tid in sweep_keys:
+        if kh:
             with VIDEO_TASK_LOCK:
-                kh = task.get("video_request_key")
-                if kh and interrupted_safe:
-                    IDEMPOTENCY_VIDEOS.pop(kh, task_id=task["id"])
+                IDEMPOTENCY_VIDEOS.pop(kh, task_id=tid)
     if not CFG.api_key:
         import secrets
         new_key = "m2a_" + secrets.token_hex(24)
