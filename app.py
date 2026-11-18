@@ -56,6 +56,7 @@ from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
                     _stage_before)  # patch22d: worker 失败落库/sweep 均调用；缺失即 NameError→僵尸 processing 任务
 from engine import MuseProxyError
 from store import Store, account_expiry, min_expiry
+from store import _read as _store_read, _write as _store_write
 from proxy import normalize_server, request_proxy_context, split_proxy_url
 import tetherpool
 from tetherpool import MANAGED_SCHEME, TP
@@ -237,13 +238,14 @@ IDEMPOTENCY_FILE = os.path.join(CFG.data_dir, "idempotency_videos.json")
 
 
 def _idem_load():
+    # 注意：本模块的 `store` 是 Store 实例（109 行），模块级 _read/_write 需显式导入
     IDEMPOTENCY_VIDEOS.update(
-        {k: v for k, v in store._read(IDEMPOTENCY_FILE, {}).items()
+        {k: v for k, v in _store_read(IDEMPOTENCY_FILE, {}).items()
          if time.time() - (v.get("ts") or 0) <= IDEMPOTENCY_TTL})
 
 
 def _idem_write():
-    store._write(IDEMPOTENCY_FILE, IDEMPOTENCY_VIDEOS)
+    _store_write(IDEMPOTENCY_FILE, IDEMPOTENCY_VIDEOS)
 QUEUE_POLICY = QueuePolicy(os.path.join(CFG.data_dir, "generation-queue.json"))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
