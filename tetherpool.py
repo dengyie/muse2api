@@ -75,7 +75,13 @@ class TetherPoolClient:
     # ---- 基础请求 ----
     def _ctl(self, method: str, path: str, timeout: float = 12.0, **kw) -> dict:
         c = _cfg()
-        r = requests.request(method, c["url"] + path, timeout=timeout, **kw)
+        # patch22r：注入 Bearer 头——控制面 11-18 起服务 token 化（
+        # IP_POOL_SERVICE_TOKENS 强制校验），原实现从不带凭据，旧时代控制面
+        # 不鉴权故从未暴露；容器重建绑定缓存清零后心跳 acquire 全 401。
+        headers = {"Authorization": f"Bearer {c['password']}"}
+        headers.update(kw.pop("headers", {}) or {})
+        r = requests.request(method, c["url"] + path, timeout=timeout,
+                             headers=headers, **kw)
         r.raise_for_status()
         return r.json()
 
