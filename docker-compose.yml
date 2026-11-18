@@ -26,6 +26,9 @@ services:
       # patch22r：控制面服务 token 化后必须显式传递（此前默认密码被 11-18
       # IP-Pool 改造除名，容器重建后心跳 acquire 401 绑定悬空）
       - MUSE2API_TETHERPOOL_PASSWORD=${MUSE2API_TETHERPOOL_PASSWORD:-}
+      # patch22r：网关 9101 共享密码（GATEWAY_PASSWORD，11-18 改造后与服务
+      # token 不同值；缺省回落 TETHERPOOL_PASSWORD 兼容旧部署）
+      - MUSE2API_TETHERPOOL_GATEWAY_PASSWORD=${MUSE2API_TETHERPOOL_GATEWAY_PASSWORD:-}
       # ---- 任务保留（patch22o/22r：与 config.py 默认值对齐，防配置漂移）----
       # 历史教训：此处曾是 :-120，压测日 93 笔/天一天挤爆、11-15 档案全灭
       # （OpenPet 409 取证断链根因）；patch22o 只改了服务器未回写仓库，

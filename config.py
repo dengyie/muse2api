@@ -167,8 +167,13 @@ class Config:
         default_factory=lambda: _env("MUSE2API_TETHERPOOL_URL", "http://127.0.0.1:9100"))
     tetherpool_gateway: str = field(
         default_factory=lambda: _env("MUSE2API_TETHERPOOL_GATEWAY", "http://127.0.0.1:9101"))
+    # patch22r：控制面服务 token 与网关共享密码拆分——11-18 IP-Pool 改造后
+    # 控制面 acquire 要 Bearer service token，网关 9101 要 GATEWAY_PASSWORD
+    # （全局共享），两个值不再相同。
     tetherpool_password: str = field(
         default_factory=lambda: _env("MUSE2API_TETHERPOOL_PASSWORD", "tetherpool"))
+    tetherpool_gateway_password: str = field(
+        default_factory=lambda: _env("MUSE2API_TETHERPOOL_GATEWAY_PASSWORD", ""))
     tetherpool_tier: str = field(
         default_factory=lambda: _env("MUSE2API_TETHERPOOL_TIER", "standard"))
     tetherpool_policy: str = field(

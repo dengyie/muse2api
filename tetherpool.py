@@ -254,14 +254,23 @@ class TetherPoolClient:
 
 
 def _gateway_proxy(aid: str, data: dict) -> dict:
-    """acquire 响应 → muse2api 账号 proxy 三元组（走参数化网关，Mode A 语义）。"""
+    """acquire 响应 → muse2api 账号 proxy 三元组（走参数化网关，Mode A 语义）。
+
+    patch22r：网关密码读 MUSE2API_TETHERPOOL_GATEWAY_PASSWORD（网关 9101 的
+    GATEWAY_PASSWORD 是全局共享值，11-18 改造后与服务 token 不同）——此前
+    复用控制面 token，网关 407 全量 ProxyError。缺省回落服务 password（旧
+    控制面/网关同值的部署形态不变）。
+    """
     user = aid
     meta = data.get("gateway_proxy_url", "")
     if "@" in meta:
         encoded = meta.split("//", 1)[-1].rsplit("@", 1)[0]
         user = encoded.rsplit(":", 1)[0] or aid
+    from config import CFG
+    gw_pw = (getattr(CFG, "tetherpool_gateway_password", "")
+             or _cfg()["password"])
     return {"server": gateway_base() + "/", "username": user,
-            "password": _cfg()["password"]}
+            "password": gw_pw}
 
 
 TP = TetherPoolClient()
