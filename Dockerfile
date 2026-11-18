@@ -40,7 +40,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制代码与必要目录（二开模块 tetherpool/mediabak/idempotency + 上游新模块 generation_timing/thumbnails）
-COPY admin.html app.py cdp.py config.py engine.py store.py proxy.py tetherpool.py mediabak.py idempotency.py generation_timing.py thumbnails.py version.json ./
+COPY admin.html app.py cdp.py config.py engine.py store.py proxy.py tetherpool.py mediabak.py idempotency.py updater.py generation_timing.py thumbnails.py version.json ./
 COPY deploy/ ./deploy/
 COPY extension/ ./extension/
 COPY tools/ ./tools/

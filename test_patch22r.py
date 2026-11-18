@@ -211,8 +211,11 @@ check("CORS uses configured origins fallback *",
       "allow_origins=(_origins or [\"*\"])" in src)
 check("key log masked to prefix", "new_key[:8]" in src
       and "已自动生成初始密钥: %s" not in src)
-check("_persist_env writes runtime.env + chmod",
-      "runtime.env" in src and "0o600" in src)
+# persist_env 迁 store.py（review 结构迭代）：实现断言改 store.py，app 断言接线
+check("persist_env in store (runtime.env + chmod)",
+      "runtime.env" in open(os.path.join(_here, "store.py"), encoding="utf-8").read()
+      and "0o600" in open(os.path.join(_here, "store.py"), encoding="utf-8").read())
+check("app wires persist_env alias", "from store import persist_env as _persist_env" in src)
 check("config loads runtime.env first + empty-env passes through",
       "runtime.env" in open(os.path.join(_here, "config.py"), encoding="utf-8").read()
       and "not os.environ.get(k)" in open(os.path.join(_here, "config.py"), encoding="utf-8").read())

@@ -10,6 +10,42 @@ import uuid
 
 from proxy import public_proxy
 
+
+def persist_env(key: str, value: str):
+    """patch22r-review：配置持久化（从 app.py 迁入——与 _read/_write 同族的
+    存储职责）。双路径：data/runtime.env（data 卷内，容器重建不丢）+ base/.env
+    兼容；均 chmod 0600（此前 umask 默认 0644）。
+
+    消费方：app 启动 key 自生成 / rotate_apikey / updater.push 的 GITHUB_TOKEN。
+    加载侧是 config._load_dotenv 的 runtime.env > .env 顺序。"""
+    import logging
+    _log = logging.getLogger("muse2api.store")
+    from config import CFG  # 函数内导入：config 不依赖 store，无循环
+    targets = [os.path.join(CFG.data_dir, "runtime.env"),
+               os.path.join(CFG.base_dir, ".env")]
+    for path in targets:
+        try:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+            except OSError:
+                lines = []
+            found = False
+            for i, ln in enumerate(lines):
+                if ln.strip().startswith(key + "="):
+                    lines[i] = f"{key}={value}"
+                    found = True
+            if not found:
+                lines.append(f"{key}={value}")
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines).strip() + "\n")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+            os.chmod(path, 0o600)
+        except OSError as exc:
+            _log.warning("【配置持久化】%s 写入失败: %s", path, str(exc)[:80])
+
 _LOCK = threading.Lock()
 
 # 登录会话存在性检查；可用性仍须经上游认证（与 engine 一致）

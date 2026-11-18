@@ -24,6 +24,14 @@ KEY=$(grep '^MUSE2API_KEY=' "$REPO/.env" 2>/dev/null | cut -d= -f2)
 if [ -z "${KEY:-}" ]; then
   echo "FATAL: $REPO/.env 缺失或无 MUSE2API_KEY——鉴权项无法执行"; exit 1
 fi
+# patch22r-review：rotate key 存 data/runtime.env（容器内），与宿主 .env 可能
+# 漂移——鉴权全 401 时先提示此因。
+KP=$(docker exec muse2api sh -c 'echo -n $MUSE2API_KEY' 2>/dev/null)
+if [ -n "$KP" ] && [ "$KP" != "$KEY" ]; then
+  echo "NOTE: 宿主 .env 的 MUSE2API_KEY 与容器内不一致（可能执行过 /admin/apikey"
+  echo "      rotate——容器改用 data/runtime.env 的新 key）。如巡检鉴权项 401，"
+  echo "      请从容器 env 或 data/runtime.env 同步新 key 回宿主 .env。"
+fi
 NO_COST=0
 [ "${1:-}" = "--no-cost" ] && NO_COST=1
 PASS=0; FAIL=0

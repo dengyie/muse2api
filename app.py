@@ -3072,37 +3072,9 @@ def rotate_apikey(_=Depends(auth)):
             "message": "已生成新 Key 并立即生效；旧 Key 已失效，请更新下游项目"}
 
 
-def _persist_env(key: str, value: str):
-    """把配置持久化（保留其它行，原子替换）。
-
-    patch22r：写 data/runtime.env（data 卷内，容器重建不丢）+ 回写 base/.env
-    保持兼容 + 两处 chmod 0600——此前只写容器层 /app/.env（非卷），rotate 后
-    容器重建即静默回滚旧 key；且落盘权限是 umask 默认 0644。
-    """
-    targets = [os.path.join(CFG.data_dir, "runtime.env"),
-               os.path.join(CFG.base_dir, ".env")]
-    for path in targets:
-        try:
-            try:
-                with open(path, encoding="utf-8") as f:
-                    lines = f.read().splitlines()
-            except OSError:
-                lines = []
-            found = False
-            for i, ln in enumerate(lines):
-                if ln.strip().startswith(key + "="):
-                    lines[i] = f"{key}={value}"
-                    found = True
-            if not found:
-                lines.append(f"{key}={value}")
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines).strip() + "\n")
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, path)
-            os.chmod(path, 0o600)
-        except OSError as exc:
-            log.warning("【配置持久化】%s 写入失败: %s", path, str(exc)[:80])
+# patch22r-review：persist_env 迁入 store.py（存储职责单一化），旧名兼容
+# 由模块级别名提供（本文件调用点不动）。
+from store import persist_env as _persist_env
 
 
 # ------------------------- 管理：Cookie 获取 -------------------------
@@ -3201,9 +3173,13 @@ def clear_tasks(payload: dict = Body(default={}), _=Depends(auth)):
         if kh:
             with VIDEO_TASK_LOCK:
                 IDEMPOTENCY_VIDEOS.pop(kh, task_id=tid)
-        # patch22r：only_terminal 锁内复查——堵「读状态→删」TOCTOU 窗口
+        # patch22r：only_terminal 锁内复查——堵「读状态→删」TOCTOU 窗口；
+        # review 补丁：快照后被 worker 领取翻转 processing 的任务计入 skipped
+        #（此前不计，removed+skipped 与快照总数对不上，排障困惑源）。
         if store.delete_task(tid, only_terminal=True):
             removed += 1
+        else:
+            skipped += 1
     return {"removed": removed, "skipped_inflight": skipped}
 
 
@@ -3467,7 +3443,7 @@ async def _keepalive_loop():
     log.info("【自动保活守护进程】已启动，检测周期: 15 分钟")
     await asyncio.sleep(1)
     try:
-        await asyncio.to_thread(_check_update_sync, True)
+        await asyncio.to_thread(_updater.check, True)
     except Exception:
         pass
     try:
@@ -3476,7 +3452,7 @@ async def _keepalive_loop():
         log.warning("【浏览器预热】异常: %s", e)
     while True:
         try:
-            await asyncio.to_thread(_check_update_sync, True)
+            await asyncio.to_thread(_updater.check, True)
         except Exception:
             pass
         try:
@@ -3510,233 +3486,35 @@ def get_keepalive_status(_=Depends(auth)):
     return KEEPALIVE_STATE
 
 
-# ------------------------- 仓库实时更新检测、通知与一键在线升级 -------------------------
-# 上游 1.6.11：仓库/分支/托管部署可配；检查只读、升级钉住单一已验证提交。
-REPO_SLUG = os.environ.get("MUSE2API_REPOSITORY", "czg86389-hub/muse2api")
-if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", REPO_SLUG):
-    REPO_SLUG = "czg86389-hub/muse2api"
-REPO_REF = os.environ.get("MUSE2API_REPO_REF", "main")
-REPO_URL = f"https://github.com/{REPO_SLUG}"
-MANAGED_DEPLOYMENT = os.environ.get("MUSE2API_MANAGED_DEPLOYMENT", "0") == "1"
-TRACKED_REPO_PATHS = [
-    "app.py", "engine.py", "store.py", "cdp.py", "config.py", "proxy.py",
-    "tetherpool.py", "mediabak.py", "generation_timing.py", "thumbnails.py",
-    "GENERATION_QUEUE.md", "VERSION_REPORTING.md",
-    "admin.html", "README.md", "version.json", "requirements.txt",
-    "Dockerfile", "docker-compose.yml", ".env.example", ".gitignore",
-    "LICENSE", "extension", "deploy", "tools",
-]
-_UPDATE_CACHE: dict[str, Any] = {"ts": 0.0, "data": None}
+# ------------------------- 仓库/版本/升级（patch22r-review 迁 updater.py）-------------------------
+# 实现（版本检查/显式升级/推送/git 面）已抽取 updater.py：不依赖 fastapi、
+# 可独立 import 测试；本文件只留路由壳（UpdaterError→HTTPException）。
+import updater as _updater
 
 
-def _read_env_key(key: str) -> str:
-    val = os.environ.get(key, "").strip()
-    if val:
-        return val
-    # patch22r：runtime.env（data 卷内）优先于 base/.env，与 _persist_env 对齐
-    for path in (os.path.join(CFG.data_dir, "runtime.env"),
-                 os.path.join(CFG.base_dir, ".env")):
-        try:
-            with open(path, encoding="utf-8") as f:
-                for ln in f.read().splitlines():
-                    s = ln.strip()
-                    if s.startswith(key + "="):
-                        return s.split("=", 1)[1].strip()
-        except OSError:
-            pass
-    return ""
-
-
-def _read_local_version() -> dict:
-    p = os.path.join(BASE_DIR, "version.json")
-    try:
-        with open(p, encoding="utf-8") as f:
-            obj = json.load(f)
-            if isinstance(obj, dict):
-                return obj
-    except Exception:
-        pass
-    return {"version": "1.5.0", "highlights": []}
-
-
-def _installed_sha_file() -> str:
-    return os.path.join(CFG.data_dir, ".installed_sha")
-
-
-def _git(args: list[str], timeout: int = 30):
-    import subprocess
-    env = dict(os.environ)
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    return subprocess.run(
-        ["git", "-c", f"safe.directory={BASE_DIR}", *args],
-        cwd=BASE_DIR,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        env=env,
-    )
-
-
-def _ensure_git_repo(token: str = ""):
-    """确保 BASE_DIR 已初始化为绑定 czg86389-hub/muse2api 的 Git 仓库。"""
-    git_dir = os.path.join(BASE_DIR, ".git")
-    remote_url = f"https://x-access-token:{token}@github.com/czg86389-hub/muse2api.git" if token else f"{REPO_URL}.git"
-    if not os.path.isdir(git_dir):
-        _git(["init", "-b", "main"])
-        _git(["remote", "add", "origin", remote_url])
-        _git(["fetch", "origin", "main"], timeout=45)
-        _git(["reset", "--mixed", "origin/main"])
-    else:
-        _git(["remote", "set-url", "origin", remote_url])
-    _git(["config", "user.name", "czg86389-hub"])
-    _git(["config", "user.email", "czg86389-hub@users.noreply.github.com"])
-
-
-# 二开（patch21）：上游 1.6.11 已彻底移除「静默自升级」——检查只读、升级必须
-# 管理员显式 POST 且钉住单一已验证提交。这里不再保留任何 Tarball 自动覆盖路径：
-# 2026-11-16 01:44 事故（自更新把 /app 覆盖成无补丁的上游 main、7 个视频任务
-# 全部超时）即旧的静默升级 worker 所致，本 fork 补丁永不在上游里。
-def _check_update_sync(force: bool = False) -> dict:
-    """A check is read-only. Report installed files and remote state separately."""
-    now = time.time()
-    if not force and _UPDATE_CACHE["data"] and now - _UPDATE_CACHE["ts"] < 90:
-        return _UPDATE_CACHE["data"]
-    import requests
-    from urllib.parse import quote
-    local = _read_local_version()
-    local_version = str(local.get("version") or "unknown")
-    local_sha = os.environ.get("MUSE2API_BUILD_SHA", "").strip()
-    has_git = os.path.exists(os.path.join(BASE_DIR, ".git"))
-    if not local_sha and has_git:
-        result = _git(["rev-parse", "HEAD"])
-        if result.returncode == 0:
-            local_sha = result.stdout.strip()
-    if not local_sha and os.path.isfile(_installed_sha_file()):
-        with open(_installed_sha_file()) as f:
-            local_sha = f.read().strip()
-    local_sha = local_sha[:7]
-    local_dirty = False
-    if has_git:
-        changed = _git(["status", "--porcelain", "--", *TRACKED_REPO_PATHS])
-        local_dirty = changed.returncode == 0 and bool(changed.stdout.strip())
-    remote_version, remote_sha, remote_commit, remote_msg, remote_time = "", "", "", "", ""
-    commits, highlights, highlights_en, errors = [], [], [], []
-    headers = {"Accept": "application/vnd.github+json", "User-Agent": "muse2api-updater"}
-    token = _read_env_key("GITHUB_TOKEN")
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    try:
-        response = requests.get(
-            f"https://api.github.com/repos/{REPO_SLUG}/commits",
-            params={"sha": REPO_REF, "per_page": 5}, headers=headers, timeout=6)
-        response.raise_for_status()
-        raw_commits = response.json()
-        remote_commit = raw_commits[0]["sha"] if raw_commits else ""
-        for commit in raw_commits:
-            info = commit.get("commit") or {}
-            commits.append({"sha": commit["sha"][:7], "message": info.get("message", "").split("\n")[0],
-                            "date": (info.get("committer") or {}).get("date", ""),
-                            "url": commit.get("html_url") or REPO_URL})
-        if commits:
-            remote_sha, remote_msg, remote_time = (commits[0][k] for k in ("sha", "message", "date"))
-    except Exception:
-        errors.append("远端提交读取失败")
-    # Pin release notes and version to the same commit as the reported remote SHA.
-    try:
-        response = requests.get(
-            f"https://raw.githubusercontent.com/{REPO_SLUG}/{quote(remote_commit or REPO_REF, safe='')}/version.json",
-            timeout=6)
-        response.raise_for_status()
-        remote = response.json()
-        remote_version = str(remote.get("version") or "")
-        highlights = list(remote.get("highlights") or [])
-        highlights_en = list(remote.get("highlights_en") or [])
-    except Exception:
-        errors.append("远端版本文件读取失败")
-    verified = bool(local_sha and remote_sha and remote_version)
-    has_update = bool((local_sha and remote_sha and local_sha != remote_sha) or
-                      (remote_version and local_version != remote_version))
-    data = {"repo_url": REPO_URL, "repo_ref": REPO_REF, "has_git": has_git,
-            "local_version": local_version, "local_sha": local_sha,
-            "remote_version": remote_version, "remote_sha": remote_sha, "remote_commit": remote_commit,
-            "remote_msg": remote_msg, "remote_time": remote_time,
-            "has_update": has_update, "up_to_date": (not has_update and not local_dirty) if verified else None,
-            "local_dirty": local_dirty,
-            "check_error": "; ".join(errors), "managed_deployment": MANAGED_DEPLOYMENT,
-            "highlights": highlights, "highlights_en": highlights_en,
-            "recent_commits": commits, "checked_at": int(now)}
-    _UPDATE_CACHE.update(ts=now, data=data)
-    return data
-
-
-def _upgrade_from_github_sync() -> dict:
-    """Explicit upgrades pin one verified remote commit and preserve deployment data."""
-    if MANAGED_DEPLOYMENT:
-        raise HTTPException(409, "此实例通过镜像部署，请从配置的仓库分支构建并更新容器")
-    if GEN_LOCK.locked() or any(t.get("status") in ("queued", "processing")
-                                for t in list(store.tasks.values())):
-        raise HTTPException(409, "仍有任务排队或运行，请等待任务完成后更新")
-    import requests
-    import tarfile
-    target = _check_update_sync(force=True).get("remote_commit", "")
-    if not re.fullmatch(r"[0-9a-f]{40}", target):
-        raise HTTPException(502, "无法确认远端目标提交，未执行更新")
-    upgraded_via = ""
-    try:
-        _ensure_git_repo(_read_env_key("GITHUB_TOKEN"))
-        for command in (["fetch", "origin", REPO_REF],
-                        ["checkout", "-f", target, "--", "."],
-                        ["reset", "--mixed", target]):
-            result = _git(command, timeout=45)
-            result.check_returncode()
-        upgraded_via = "git"
-    except Exception as exc:
-        log.warning("Git 更新未完成，尝试固定提交归档 (%s)", type(exc).__name__)
-    if not upgraded_via:
-        response = requests.get(f"https://codeload.github.com/{REPO_SLUG}/tar.gz/{target}", timeout=60)
-        if response.status_code != 200:
-            raise HTTPException(502, f"下载更新包失败 (HTTP {response.status_code})")
-        with tarfile.open(fileobj=io.BytesIO(response.content), mode="r:gz") as archive:
-            for member in archive.getmembers():
-                parts = member.name.split("/", 1)
-                if len(parts) < 2 or not parts[1]:
-                    continue
-                rel = parts[1].replace("\\", "/")
-                if rel.startswith("/") or ".." in rel.split("/") or rel == ".env" or rel.startswith("data/") or rel.startswith(".git/"):
-                    continue
-                path = os.path.join(BASE_DIR, rel)
-                if member.isdir():
-                    os.makedirs(path, exist_ok=True)
-                elif member.isfile():
-                    os.makedirs(os.path.dirname(path), exist_ok=True)
-                    with archive.extractfile(member) as source, open(path, "wb") as out:
-                        out.write(source.read())
-        upgraded_via = "tarball"
-    # Record what was installed, never a newer remote HEAD observed after the download.
-    with open(_installed_sha_file(), "w") as f:
-        f.write(target)
-    _UPDATE_CACHE["ts"] = 0.0
-    status = _check_update_sync(force=True)
-    status["local_sha"] = target[:7]
-    status["has_update"] = bool(status.get("remote_sha") and status["remote_sha"] != target[:7])
-    status["up_to_date"] = not status["has_update"] if status.get("remote_sha") else None
-    return {"ok": True, "via": upgraded_via, "installed_sha": target,
-            "message": f"已安装版本 {_read_local_version().get('version')} ({target[:7]})", "status": status}
+def _busy_check() -> bool:
+    """升级占用检查（业务并发面归 app，updater 不感知）。"""
+    return GEN_LOCK.locked() or any(
+        t.get("status") in ("queued", "processing")
+        for t in list(store.tasks.values()))
 
 
 @app.get("/admin/update/check")
 @app.get("/admin/repo/status")
-async def admin_check_update(force: bool = False, _=Depends(auth)):
-    """检测上游仓库是否有新版本。patch13(F2)：加鉴权且 HTTP 路径不触发静默
-    自升级（未鉴权 GET 曾可后台拉起 os._exit(0) 重启，杀掉进行中的付费生成）。"""
-    return await asyncio.to_thread(_check_update_sync, force)
+async def admin_update_check(force: bool = False, _=Depends(auth)):
+    """只读检查。鉴权加固（patch21）：自升级（未鉴权 GET 曾可后台拉起
+    os._exit(0) 重启，杀掉进行中的付费生成）。"""
+    return await asyncio.to_thread(_updater.check, force)
 
 
 @app.post("/admin/update/upgrade")
 @app.post("/admin/repo/pull")
 async def admin_upgrade_now(payload: dict = Body(default={}), _=Depends(auth)):
     """一键从 GitHub 官方仓库拉取最新更新并自动平滑重启服务。"""
-    res = await asyncio.to_thread(_upgrade_from_github_sync)
+    try:
+        res = await asyncio.to_thread(_updater.upgrade, _busy_check)
+    except _updater.UpdaterError as exc:
+        raise HTTPException(exc.status, str(exc))
     restart = payload.get("restart", True) if isinstance(payload, dict) else True
     if restart:
         def _delayed_restart():
@@ -3753,38 +3531,19 @@ async def admin_upgrade_now(payload: dict = Body(default={}), _=Depends(auth)):
 @app.post("/admin/repo/push")
 async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
     """维护者专用：将当前节点核心代码推送到 GitHub 仓库（自动过滤 .env 与 data 目录）。"""
-    msg = (payload.get("message") or "").strip() or f"chore: sync update ({time.strftime('%Y-%m-%d %H:%M:%S')})"
+    msg = (payload.get("message") or "").strip()
     new_token = (payload.get("github_token") or "").strip()
     if new_token:
         _persist_env("GITHUB_TOKEN", new_token)
         os.environ["GITHUB_TOKEN"] = new_token
-    token = new_token or _read_env_key("GITHUB_TOKEN")
+    token = new_token or _updater.read_env_key("GITHUB_TOKEN")
+    try:
+        return await asyncio.to_thread(_updater.push, msg, token)
+    except _updater.UpdaterError as exc:
+        raise HTTPException(exc.status, str(exc))
 
-    def _do_push():
-        _ensure_git_repo(token)
-        existing_paths = [p for p in TRACKED_REPO_PATHS if os.path.exists(os.path.join(BASE_DIR, p))]
-        _git(["add", "--", *existing_paths])
-        st = _git(["status", "--porcelain", "--", *existing_paths])
-        committed = False
-        if st.stdout.strip():
-            c_res = _git(["commit", "-m", msg])
-            if c_res.returncode != 0:
-                raise HTTPException(500, f"Git commit 失败: {c_res.stderr or c_res.stdout}")
-            committed = True
-        p_res = _git(["push", "origin", "HEAD:main"], timeout=60)
-        if p_res.returncode != 0:
-            err = (p_res.stderr or p_res.stdout or "").strip()
-            raise HTTPException(500, f"Git push 失败: {err[:300]}")
-        _UPDATE_CACHE["ts"] = 0.0
-        status = _check_update_sync(force=True)
-        return {
-            "ok": True,
-            "committed": committed,
-            "message": "已成功提交并推送到 GitHub 仓库",
-            "status": status,
-        }
 
-    return await asyncio.to_thread(_do_push)
+
 
 
 @app.on_event("startup")
