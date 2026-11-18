@@ -73,6 +73,9 @@ class MediaBackuper:
         self._chan: str | None = None      # 当前可用通道: "mesh" | "public"
         self._consecutive_fail = 0
         self._backoff_until = 0.0
+        # patch22r：交付回源独立退避（与备份扫描分离）
+        self._delivery_consecutive_fail = 0
+        self._delivery_backoff_until = 0.0
         self._mesh_dead_until = 0.0        # patch22n：mesh 探测失败冷却（连不上的通道不再每轮先撞 15s）
 
     # ---- 通道与鉴权 ----
@@ -247,12 +250,12 @@ class MediaBackuper:
         """
         if not enabled() or not name or "/" in name or "\\" in name or ".." in name:
             return None
-        if self.in_backoff():
+        if self.delivery_in_backoff():
             log.warning("【媒体回源】备份通道退避中，跳过回源 %s", name)
             return None
         tok, chan = self._get_token()
         if not tok:
-            self._note_fail()
+            self._note_delivery_fail()
             return None
         base = _cfg()["base"]
         try:
@@ -262,13 +265,13 @@ class MediaBackuper:
             data = r.json()
         except Exception as exc:
             log.warning("【媒体回源】列目录失败: %s", str(exc)[:100])
-            self._note_fail()
+            self._note_delivery_fail()
             return None
         if data.get("code") in (401, 403):
             self._invalidate_token()
             return None
         if data.get("code") != 200:
-            self._note_fail()
+            self._note_delivery_fail()
             return None
         days = sorted(((c.get("name") or "") for c in (data.get("data") or {}).get("content") or []),
                       reverse=True)
@@ -291,15 +294,19 @@ class MediaBackuper:
             if not raw_url:
                 continue
             try:
-                rr = requests.get(raw_url, headers=_UA, timeout=120)
+                # patch22r：超时按体积伸缩（原固定 120s，大视频慢通道必 503）；
+                # 对齐 _put/_remote_sha 的 size // (512KB) 公式，60s 下限
+                dl_size = (data.get("data") or {}).get("size") or 0
+                dl_timeout = max(60, int(dl_size) // (512 * 1024)) if dl_size else 300
+                rr = requests.get(raw_url, headers=_UA, timeout=dl_timeout)
             except Exception as exc:
                 log.warning("【媒体回源】raw 下载失败 %s/%s: %s", day, name, str(exc)[:80])
-                self._note_fail()
+                self._note_delivery_fail()
                 return None
             if rr.status_code == 200 and rr.content:
                 self._note_ok()
                 return rr.content
-            self._note_fail()
+            self._note_delivery_fail()
             return None
         return None
 
@@ -391,6 +398,21 @@ class MediaBackuper:
                 self._backoff_until = time.monotonic() + _FAIL_BACKOFF_SECS
                 log.warning("【媒体备份】连续失败 %d 次，退避 %d 分钟（本地文件保留）",
                             self._consecutive_fail, _FAIL_BACKOFF_SECS // 60)
+
+    def _note_delivery_fail(self):
+        """patch22r：交付回源独立退避计数——原实现与备份扫描共享 _note_fail，
+        交付突发失败（网络抖动）会连坐停摆备份 30 分钟（成品 url 变 30 分钟
+        不可读 + 新成品不备份）。两个面分开计数互不传染。"""
+        with self._lock:
+            self._delivery_consecutive_fail += 1
+            if self._delivery_consecutive_fail >= _FAIL_BACKOFF_THRESHOLD:
+                self._delivery_backoff_until = time.monotonic() + _FAIL_BACKOFF_SECS
+                log.warning("【媒体回源】连续失败 %d 次，回源退避 %d 分钟（备份扫描不受影响）",
+                            self._delivery_consecutive_fail, _FAIL_BACKOFF_SECS // 60)
+
+    def delivery_in_backoff(self) -> bool:
+        with self._lock:
+            return time.monotonic() < self._delivery_backoff_until
 
     def in_backoff(self) -> bool:
         with self._lock:

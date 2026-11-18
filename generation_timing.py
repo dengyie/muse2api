@@ -1,21 +1,44 @@
 """Independent queue budget and generation task timing."""
 from __future__ import annotations
 import os
+import logging
 from pathlib import Path
 import tempfile
 import threading
 import time
 from pydantic import BaseModel, ConfigDict, Field
 
+log = logging.getLogger("muse2api")
+
 class QueueSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    queue_timeout: int = Field(default=3600, ge=0, le=86400)
+    # patch22r：ge=1 禁 0——原 ge=0 时管理员设 0 想表达「不排队」，但
+    # GEN_LOCK.acquire(timeout=queue_timeout or None) 把 0 变 None = 无限
+    # 排队，语义反转。禁用 0 消除歧义（要更短排队直接设 1 秒）。
+    queue_timeout: int = Field(default=3600, ge=1, le=86400)
 
 class QueuePolicy:
     def __init__(self, path):
         self.path = Path(path)
         self.lock = threading.RLock()
-        self.value = QueueSettings.model_validate_json(self.path.read_text()) if self.path.exists() else QueueSettings()
+        self.value = self._load()
+
+    def _load(self):
+        """patch22r：损坏文件容错——坏 JSON 不再阻断整个应用启动
+        （import 期 crash-loop）。坏文件改名 .bad 留证并回退默认值。"""
+        if not self.path.exists():
+            return QueueSettings()
+        try:
+            return QueueSettings.model_validate_json(self.path.read_text())
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.path.replace(self.path.with_suffix(".json.bad"))
+                log.warning("【队列配置】%s 损坏（%s），已改名 .bad 留证，"
+                            "回退默认值", self.path, str(exc)[:80])
+            except OSError:
+                log.warning("【队列配置】%s 损坏（%s），回退默认值",
+                            self.path, str(exc)[:80])
+            return QueueSettings()
 
     def settings(self):
         with self.lock:

@@ -211,13 +211,20 @@ check("401 invalidates token", BK._token is None)
 mediabak.requests.post = fake_post
 mediabak.requests.get = fake_get
 
-# 退避：连续失败达阈值后 fetch 直接跳过
+# 退避语义（patch22r 改动）：备份退避与交付回源退避分离——备份通道故障
+# 不再连坐停摆回源交付；交付侧有自己的独立退避。
 BK._consecutive_fail = mediabak._FAIL_BACKOFF_THRESHOLD
 BK._backoff_until = time.monotonic() + 60
 _state["posts"] = []
 got = BK.fetch_remote("x.mp4")
-check("backoff skips fetch", got is None)
-check("backoff no remote calls", _state["posts"] == [], _state["posts"])
+check("backup backoff does NOT block delivery fetch", got is not None or _state["posts"], "交付回源应不受备份退避影响")
+check("backup backoff no backup calls", BK.scan_once.__self__ is BK)  # scan 路径仍受 _backoff_until 管
+BK._delivery_consecutive_fail = mediabak._FAIL_BACKOFF_THRESHOLD
+BK._delivery_backoff_until = time.monotonic() + 60
+_state["posts"] = []
+got = BK.fetch_remote("x.mp4")
+check("delivery backoff skips fetch", got is None)
+check("delivery backoff no remote calls", _state["posts"] == [], _state["posts"])
 BK._backoff_until = 0.0
 BK._consecutive_fail = 0
 

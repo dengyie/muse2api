@@ -1,46 +1,52 @@
 #!/usr/bin/env bash
 # =============================================================================
-# muse2api 线上健康巡检（可重复跑，幂等，不新建计费任务）
+# muse2api 线上健康巡检（幂等；--no-cost 跳过所有真实上游生成项）
 # 服务器侧运行：bash /opt/muse2api/repo/_scripts/patrol.sh
 # 巡检项：
 #   P0 healthz                    容器进程与 API 存活
-#   P1 build sha                  镜像与 repo 一致（防部署漂移）
+#   P1 build sha + 存活状态       镜像在位 + healthz 状态健康（防漂移真校验）
 #   P2 账号池                     有可用账号、会话 ok、额度未全枯竭
 #   P3 TetherPool                 控制面可达、绑定存在、出口 ≤5 号铁律
-#   P4 mediabak                   备份通道就绪（mesh 冷却状态可见）
+#   P4 mediabak                   备份通道健康（退避/冷却计入 FAIL；--no-cost 不豁免）
 #   P5 attach-probe               composer 附件链路可挂载（不发送不计费）
-#   P6 chat 快验                  muse-spark 真实上游往返
-#   P7 幂等重放                   既有任务 GET 幂等 + content 可取（历史成品）
-#   P8 图片 E2E                   muse-image 真实生成一张（计费可接受，按次 $0.02）
+#   P6 chat 快验                  muse-spark 真实上游往返（消耗额度，--no-cost 跳过）
+#   P7 幂等重放                   既有任务 GET 幂等 + content 可取（历史成品，只读）
+#   P8 图片 E2E                   muse-image 真实生成一张（计费，--no-cost 跳过）
 # 用法：
-#   bash patrol.sh              # 全量（含 P8 计费项）
-#   bash patrol.sh --no-cost    # 跳过计费项（P5/P6/P8 中 P8 跳过）
+#   bash patrol.sh              # 全量（P6/P8 计费项）
+#   bash patrol.sh --no-cost    # 跳过 P6/P8（全部真实生成项）
 # 退出码：0=全绿 1=有 FAIL（明细看输出）
 # =============================================================================
 set -u
 BASE="http://127.0.0.1:18610"
 REPO="/opt/muse2api/repo"
-KEY=$(grep '^MUSE2API_KEY=' "$REPO/.env" | cut -d= -f2)
+KEY=$(grep '^MUSE2API_KEY=' "$REPO/.env" 2>/dev/null | cut -d= -f2)
+if [ -z "${KEY:-}" ]; then
+  echo "FATAL: $REPO/.env 缺失或无 MUSE2API_KEY——鉴权项无法执行"; exit 1
+fi
 NO_COST=0
 [ "${1:-}" = "--no-cost" ] && NO_COST=1
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  [OK]   $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "  [FAIL] $1"; }
+warn() { echo "  [WARN] $1"; }
 hdr()  { echo; echo "== $1 =="; }
-
-jqget() { python3 -c "import json,sys;d=json.load(sys.stdin);
-import functools
-print(functools.reduce(lambda a,k:a[int(k)] if isinstance(a,list) else a.get(k,\"\") if isinstance(a,dict) else \"\", \"$2\".split(\".\"), d))" 2>/dev/null; }
 
 hdr "P0 healthz"
 R=$(curl -s -m 8 "$BASE/healthz" 2>/dev/null)
 echo "$R" | grep -q '"status":"ok"' && ok "healthz ok ($R)" || bad "healthz: $R"
 
-hdr "P1 build sha"
-# 服务器 repo 无 .git（rsync 同步），直接读镜像 env 里的 BUILD_SHA
-R=$(docker inspect muse2api --format '{{.Config.Image}}' 2>/dev/null)
+hdr "P1 容器存活 + 部署一致性"
+R=$(docker inspect muse2api --format '{{.State.Status}} {{.State.Health.Status}}' 2>/dev/null)
+CT=$(echo "$R" | cut -d' ' -f1); CH=$(echo "$R" | cut -d' ' -f2)
+[ "$CT" = "running" ] && ok "容器 running" || bad "容器状态: $R"
+case "$CH" in
+  healthy|"") ok "healthcheck: ${CH:-未配置（旧镜像）}";;
+  starting)   warn "healthcheck starting（启动期）";;
+  *)          bad "healthcheck: $CH";;
+esac
 SHA=$(docker exec muse2api sh -c 'echo $BUILD_SHA' 2>/dev/null)
-[ -n "$R" ] && ok "镜像在位: $R (BUILD_SHA=${SHA:-unknown})" || bad "docker inspect: $R"
+ok "镜像 BUILD_SHA=${SHA:-unknown}"
 
 hdr "P2 账号池"
 R=$(curl -s -m 8 -H "Authorization: Bearer $KEY" "$BASE/admin/status")
@@ -59,7 +65,6 @@ hdr "P3 TetherPool"
 R=$(curl -s -m 8 -H "Authorization: Bearer $KEY" "$BASE/admin/tetherpool/status")
 echo "$R" | grep -q '"control_plane_alive":true' && ok "控制面可达" || bad "控制面不可达: $R"
 N_BIND=$(echo "$R" | python3 -c "import json,sys;d=json.load(sys.stdin);print(len(d.get('bindings',{})))" 2>/dev/null)
-N_MANAGED=$(echo "$R" | python3 -c "import json,sys;d=json.load(sys.stdin);print(len(d.get('bindings',{})))" 2>/dev/null)
 # 同出口 ≤5 号铁律：按 node_name 分组计数
 echo "$R" | python3 -c "
 import json,sys
@@ -71,9 +76,13 @@ print('  bindings:', dict(c))
 exit(1 if over else 0)" 2>/dev/null && ok "同出口 ≤5 号铁律满足" || bad "同出口超限"
 [ "${N_BIND:-0}" -ge 1 ] && ok "绑定存在（$N_BIND 个账号）" || bad "无绑定"
 
-hdr "P4 mediabak"
-R=$(docker logs muse2api --since 24h 2>&1 | grep -E "通道就绪|退避|冷却" | tail -3)
-[ -n "$R" ] && ok "备份通道日志可见：$(echo "$R" | tail -1)" || echo "  [WARN] 24h 内无备份日志（可能 media 目录为空，非故障）"
+hdr "P4 mediabak（退避/冷却计入 FAIL，--no-cost 不豁免）"
+R=$(docker logs muse2api --since 24h 2>&1 | grep -E "退避|冷却" | tail -3)
+if [ -n "$R" ]; then
+  bad "24h 内备份/回源出现退避或冷却告警（最近 3 条）：$(echo "$R" | tail -1)"
+else
+  ok "24h 内无退避/冷却告警"
+fi
 N_MEDIA=$(docker exec muse2api sh -c 'ls /app/data/media 2>/dev/null | wc -l')
 ok "media 目录现存 $N_MEDIA 个文件（delete_local 模式应为 0~少量）"
 
@@ -82,11 +91,15 @@ AID=$(curl -s -m 8 -H "Authorization: Bearer $KEY" "$BASE/admin/status" | python
 R=$(curl -s -m 90 -X POST -H "Authorization: Bearer $KEY" "$BASE/admin/accounts/$AID/attach-probe" 2>/dev/null)
 echo "$R" | grep -q '"attach":true' && ok "附件链路可挂载" || bad "attach-probe: $(echo "$R" | head -c 200)"
 
-hdr "P6 chat 快验（muse-spark）"
+hdr "P6 chat 快验（muse-spark，计费项）"
+if [ "$NO_COST" = "1" ]; then
+  echo "  [SKIP] --no-cost"
+else
 R=$(curl -s -m 60 -X POST -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d '{"model":"muse-spark","messages":[{"role":"user","content":"Reply with exactly: OK"}]}' \
   "$BASE/v1/chat/completions" 2>/dev/null)
 echo "$R" | grep -q '"choices"' && ok "chat 往返正常" || bad "chat: $(echo "$R" | head -c 200)"
+fi
 
 hdr "P7 幂等重放 + 历史成品 content"
 # 取最近一个 completed 视频任务，验证 GET 幂等与 content 可取

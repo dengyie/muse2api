@@ -477,19 +477,31 @@ class MuseEngine:
         实证两个残留目录）。__init__ 时集合必为空，凡已存在的 context-*
         目录都是上一次进程的遗产，全部清掉；若目录里有未备份的媒体残留，
         mediabak 只扫 media_dir，不受影响。
+        patch22r：顺带清扫 muse2api-refs-* 附件上传临时目录——崩溃时来不及
+        删，残留即用户参考素材副本落盘（磁盘 + 隐私）。
         """
         try:
             d = getattr(self.cfg, "download_dir", None)
-            if not d or not os.path.isdir(d):
-                return
-            removed = 0
-            for name in os.listdir(d):
-                if name.startswith("context-"):
-                    shutil.rmtree(os.path.join(d, name), ignore_errors=True)
-                    removed += 1
-            if removed:
-                logging.getLogger("muse2api.engine").info(
-                    "patch25: 清扫上次运行遗留孤儿下载目录 %d 个", removed)
+            if d and os.path.isdir(d):
+                removed = 0
+                for name in os.listdir(d):
+                    if name.startswith("context-"):
+                        shutil.rmtree(os.path.join(d, name), ignore_errors=True)
+                        removed += 1
+                if removed:
+                    logging.getLogger("muse2api.engine").info(
+                        "patch25: 清扫上次运行遗留孤儿下载目录 %d 个", removed)
+            # patch22r：附件上传临时目录（同上遗产语义，全清安全）
+            pd = getattr(self.cfg, "profile_dir", None)
+            if pd and os.path.isdir(pd):
+                removed = 0
+                for name in os.listdir(pd):
+                    if name.startswith("muse2api-refs-"):
+                        shutil.rmtree(os.path.join(pd, name), ignore_errors=True)
+                        removed += 1
+                if removed:
+                    logging.getLogger("muse2api.engine").info(
+                        "patch22r: 清扫上次运行遗留附件上传临时目录 %d 个", removed)
         except OSError:
             pass
 
@@ -531,7 +543,22 @@ class MuseEngine:
     def start(self):
         with self._start_lock:
             if self.proc and self.proc.poll() is None and self.browser:
-                return
+                # patch22r：早退前廉价探活——原实现只看「进程活 + 有 browser
+                # 对象」，browser 级 CDP websocket 断链（长会话/资源紧张时发生）
+                # 后每个任务在 _open_page 失败且被误分类为 MuseProxyError，15
+                # 分钟一次的预热同样被此早退短路，唯一恢复手段是容器重启。
+                # 探活失败 → 关闭死连接置 None，走下方正常重启分支自愈。
+                try:
+                    http_json(self._debug_url(), timeout=3)
+                except Exception:
+                    log.warning("【浏览器】CDP 端点探活失败（进程存活但连接已死），重建 browser 连接")
+                    try:
+                        self.browser.close()
+                    except Exception:
+                        pass
+                    self.browser = None
+                else:
+                    return
             env = dict(os.environ)
             env.setdefault("HOME", self.cfg.home_dir)
             env["PATH"] = (self.cfg.extra_path + os.pathsep + env.get("PATH", "")) if self.cfg.extra_path else env.get("PATH", "")
@@ -567,6 +594,12 @@ class MuseEngine:
                         pass
 
             os.makedirs(self.cfg.data_dir, exist_ok=True)
+            # patch22r：重启分支先关旧日志句柄（start/stop 循环句柄泄漏）
+            try:
+                if getattr(self, "_log", None) and not self._log.closed:
+                    self._log.close()
+            except Exception:
+                pass
             self._log = open(os.path.join(self.cfg.data_dir, "chromium.log"), "ab", buffering=0)
             cwd_dir = self.cfg.home_dir if (self.cfg.home_dir and os.path.isdir(self.cfg.home_dir)) else None
             self.proc = subprocess.Popen(args, stdout=self._log, stderr=subprocess.STDOUT,
@@ -605,6 +638,12 @@ class MuseEngine:
                 except Exception:  # noqa: BLE001
                     self.proc.kill()
             self.proc = None
+            # patch22r：stop 收尾关 chromium.log 句柄（start/stop 循环泄漏）
+            try:
+                if getattr(self, "_log", None) and not self._log.closed:
+                    self._log.close()
+            except Exception:
+                pass
             with self._contexts_lock:
                 relays = list(self._proxy_relays)
                 self._proxy_relays.clear()
@@ -991,8 +1030,8 @@ class MuseEngine:
         即 OpenPet 两笔历史失败的直接根因之一）。可交互判定以 textarea+hydration
         +无 Connecting... 为准，比文档加载事件更贴近真实可用性。
         """
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             try:
                 st = page.js("""(function(){
                     var rs = document.readyState;
@@ -1046,8 +1085,8 @@ class MuseEngine:
             })(%s)""" % ("true" if for_chat else "false"))
             if needs_nav:
                 self.page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
-                t_end = time.time() + 10.0
-                while time.time() < t_end:
+                t_end = time.monotonic() + 10.0
+                while time.monotonic() < t_end:
                     time.sleep(0.08)
                     ready = self.page.js("""(function(){
                         return document.readyState === 'complete'
@@ -1498,8 +1537,8 @@ class MuseEngine:
 
         # 等待发送按钮就绪并点击
         clicked = "no-button"
-        t_deadline = time.time() + 3.0
-        while time.time() < t_deadline:
+        t_deadline = time.monotonic() + 3.0
+        while time.monotonic() < t_deadline:
             res = self._click_send()
             if res == "clicked":
                 clicked = "clicked"
@@ -1579,8 +1618,8 @@ class MuseEngine:
                          base_att_cnt: int = 0, stop_event=None, baseline_sources=None,
                          has_upload: bool = False, base_user_cnt: int = 0) -> dict | None:
         baseline_sources = set(baseline_sources or ()) | {baseline_src}
-        deadline = time.time() + timeout
-        t_start = time.time()
+        deadline = time.monotonic() + timeout
+        t_start = time.monotonic()
         stable_src, stable_n = "", 0
         last_txt, txt_stable = "", 0
         refusal_last, refusal_stable = "", 0
@@ -1594,10 +1633,11 @@ class MuseEngine:
         # att_ever_grew = presentation 附件曾挂载过（上游处理附件的痕迹）。
         user_bubble_seen = False
         att_ever_grew = False
+        page_poll_fails = 0  # patch22r：页面死检测连续失败计数
         # patch12：base_user_cnt 由调用方在 _send 之前采集传入（patch11 在此
         # 采集太晚——气泡可能在 send 与 wait 进入之间已渲染，基线被污染，
         # 收据永远判不出 → L2 误判已送达消息并重复提交）。
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             if stop_event is not None and stop_event.is_set():
                 raise MuseGenerationError("客户端已断开连接，终止生成任务")
             time.sleep(0.6)
@@ -1657,7 +1697,7 @@ class MuseEngine:
                         stable_src, stable_n = check_src, 0
                     if stable_n >= 1:
                         return att
-            elapsed = time.time() - t_start
+            elapsed = time.monotonic() - t_start
             cur_cnt = base_agent_cnt
             cur_txt = ""
             has_stop = False
@@ -1675,8 +1715,18 @@ class MuseEngine:
                         path: location.pathname || '', href: location.href || ''});
                 })()""")
                 st = json.loads(st_raw) if st_raw else {}
+                page_poll_fails = 0  # patch22r：成功即清零
             except Exception:
                 st = {}
+                # patch22r：页面死检测——原实现所有 CDP 异常静默吞掉按「计数 0」
+                # 处理，页面 crash/target 被杀/浏览器假死时会静默空转到总超时，
+                # 且无附件任务终态判 retryable=False 不切号（一次 crash 判死整个
+                # 任务）。连续失败（~30s）快速失败为可换号错误。
+                page_poll_fails += 1
+                if page_poll_fails >= 10:
+                    raise MuseGenerationError(
+                        "生成页面失去响应（CDP 连续读失败），已提前终止以释放账号",
+                        code="page_lost", stage="wait", retryable=True)
             tail = st.get("tail") or ""
             cur_cnt = int(st.get("cnt") or 0)
             cur_txt = st.get("txt") or ""
@@ -1685,7 +1735,7 @@ class MuseEngine:
             seen_stop = seen_stop or has_stop
             state = (cur_cnt, cur_txt, len(atts), has_stop, path)
             if previous_state is None or state != previous_state:
-                last_activity = time.time()
+                last_activity = time.monotonic()
                 previous_state = state
 
             if on_progress:
@@ -1797,7 +1847,7 @@ class MuseEngine:
             if (expect == "video" and seen_stop and not has_stop
                     and path.rstrip("/").endswith("/thread/new")
                     and cur_cnt <= base_agent_cnt and len(atts) <= base_att_cnt
-                    and elapsed >= 180.0 and time.time() - last_activity >= 90.0):
+                    and elapsed >= 180.0 and time.monotonic() - last_activity >= 90.0):
                 raise MuseGenerationError(
                     "Muse 未建立视频任务线程，页面在提交结束后持续无响应（已提前停止等待）")
         return None
@@ -1971,20 +2021,20 @@ class MuseEngine:
         base_agent, base_text, _ = self._poll_chat()
         self._send(prompt)
 
-        t_sent = time.time()
+        t_sent = time.monotonic()
         deadline = t_sent + timeout
         first_token_deadline = min(deadline, t_sent + 40.0)
         sent, last, stable = "", None, 0
         got_first = False
 
         # 1. 等待助手生成并开始吐字（高频 60ms 采样，捕获到首批增量文字瞬间 yield 出去）
-        while time.time() < first_token_deadline:
+        while time.monotonic() < first_token_deadline:
             if stop_event is not None and stop_event.is_set():
                 return
             time.sleep(0.06)
             cnt, cur, has_stop = self._poll_chat()
             if not cur or (cnt <= base_agent and cur == base_text):
-                if time.time() - t_sent > 14.0:
+                if time.monotonic() - t_sent > 14.0:
                     try:
                         tail = self.page.js("document.body.innerText.slice(-500)") or ""
                     except Exception:
@@ -2005,7 +2055,7 @@ class MuseEngine:
             raise MuseGenerationError("等待助手首字响应超时")
 
         # 2. 持续捕获增量文本
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             if stop_event is not None and stop_event.is_set():
                 return
             time.sleep(0.06)
@@ -2077,8 +2127,8 @@ class MuseEngine:
         })(%s)""" % json.dumps(src))
         if clicked == "none":
             return None
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             time.sleep(1.5)
             new = [f for f in (set(os.listdir(directory)) - before)
                    if not f.endswith(".crdownload")]
@@ -2468,7 +2518,11 @@ class MuseEngine:
             selected_src = (att.get("vSrc") if expect == "video" else None) or att.get("src") or ""
             _cb(on_stage, "extract")
             try:
-                data, mime, url = self.extract_bytes(selected_src, expect=expect)
+                # patch22r：接线 stop_event——patch13(F7) 在 extract_bytes 内
+                # 加了取消检查但唯一调用点没传参，检查恒不生效（blob 回取
+                # 反复失败时 4×600s ≈ 40 分钟独占账号不可取消）。
+                data, mime, url = self.extract_bytes(selected_src, expect=expect,
+                                                     stop_event=stop_event)
             except Exception:  # noqa: BLE001
                 self._debug_dump("extract-fail")
 
@@ -2581,15 +2635,9 @@ class MuseEngine:
 
     @staticmethod
     def _debug_enabled() -> bool:
-        # patch13(F16)：debug dump 默认关——tail 含用户 prompt 与模型回复明文，
-        # 多用户场景下等于把用户内容留盘。MUSE2API_DEBUG_DUMP=1 显式开启。
-        import os as _os
-        return _os.environ.get("MUSE2API_DEBUG_DUMP", "0").strip() == "1"
-
-    @staticmethod
-    def _debug_enabled() -> bool:
         # patch13(F16)：debug dump 默认关——dump 含用户 prompt 与模型回复明文，
         # 多用户场景下等于把用户内容留盘。MUSE2API_DEBUG_DUMP=1 显式开启。
+        # patch22r：删除重复定义（merge 时引入的双胞胎方法，取后者语义）。
         return os.environ.get("MUSE2API_DEBUG_DUMP", "0").strip() == "1"
 
     def _debug_dump(self, tag: str):

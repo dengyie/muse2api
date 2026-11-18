@@ -9,24 +9,36 @@ _DEFAULT_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def _load_dotenv():
-    """自动加载项目根目录下的 .env 文件（不覆盖已存在的系统环境变量）。"""
+    """自动加载 .env（patch22r：双路径 + 空值穿透）。
+
+    ① data/runtime.env > base/.env——rotate key 经 _persist_env 写 runtime.env
+      （在 data 卷内，容器重建不丢）；base/.env 在容器层，重启即失（22r 前的
+      rotate 持久化是假的）。
+    ② 环境变量为**空字符串**时视为未设置继续用 dotenv——compose 的
+      `MUSE2API_KEY=${MUSE2API_KEY:-}` 会把空串注入 environ，原实现被空值
+      压制后每次重启都重新生成 key 且轮换不落盘。
+    不覆盖非空系统环境变量。"""
     base = os.environ.get("MUSE2API_HOME") or _DEFAULT_BASE_DIR
-    env_path = os.path.join(base, ".env")
-    if not os.path.isfile(env_path):
-        return
-    try:
-        with open(env_path, encoding="utf-8") as f:
-            for line in f:
-                s = line.strip()
-                if not s or s.startswith("#") or "=" not in s:
-                    continue
-                k, v = s.split("=", 1)
-                k = k.strip()
-                v = v.strip().strip("'\"")
-                if k and k not in os.environ:
-                    os.environ[k] = v
-    except OSError:
-        pass
+    candidates = [
+        os.path.join(base, "data", "runtime.env"),
+        os.path.join(base, ".env"),
+    ]
+    for env_path in candidates:
+        if not os.path.isfile(env_path):
+            continue
+        try:
+            with open(env_path, encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s or s.startswith("#") or "=" not in s:
+                        continue
+                    k, v = s.split("=", 1)
+                    k = k.strip()
+                    v = v.strip().strip("'\"")
+                    if k and not os.environ.get(k):
+                        os.environ[k] = v
+        except OSError:
+            pass
 
 
 _load_dotenv()
@@ -94,9 +106,10 @@ class Config:
         default_factory=lambda: _env("MUSE2API_PUBLIC_BASE", ""))
 
     # 允许跨域调用导入接口的来源（Cookie 助手脚本从 muse.ai 页面提交时用）
+    # patch22r：默认空=允许全部来源（["*"]，Web 客户端生态兼容——Open WebUI/
+    # LobeChat 浏览器端直连）；要收紧 CORS 时显式设逗号分隔来源列表。
     cors_origins: str = field(
-        default_factory=lambda: _env("MUSE2API_CORS_ORIGINS",
-                                     "https://muse.ai,https://www.muse.ai"))
+        default_factory=lambda: _env("MUSE2API_CORS_ORIGINS", ""))
 
     # 生成
     image_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_IMAGE_TIMEOUT", "240")))
@@ -108,6 +121,9 @@ class Config:
     # patch22o：已完成任务时间保留窗口（天）。0=只按条数裁。压测日 93 笔/天
     # 会把 120 条上限一天挤爆——2026-11-15 档案全灭导致 OpenPet 409 取证断链。
     tasks_keep_days: int = field(default_factory=lambda: max(0, int(_env("MUSE2API_TASKS_KEEP_DAYS", "30"))))
+    # patch22r：归档索引条数上限（超限按 archived_at 淘最老）。0=不限。
+    # 成品媒体本体有 mediabak 保留策略兜底，索引淘汰只影响溯源可见窗口。
+    archive_index_max: int = field(default_factory=lambda: max(0, int(_env("MUSE2API_ARCHIVE_INDEX_MAX", "50000"))))
     # 二开（patch7）：媒体文件保留小时数；0=永久保留（现状默认）。
     media_retention_hours: int = field(default_factory=lambda: max(0, int(_env("MUSE2API_MEDIA_RETENTION_HOURS", "0"))))
     # 二开（patch8）：媒体云备份（MangoDrive/OpenList）。默认关闭；pass 建议宿主 .env 注入。

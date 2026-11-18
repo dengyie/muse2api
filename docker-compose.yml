@@ -9,11 +9,12 @@ services:
     ports:
       - "127.0.0.1:18610:18610"
     environment:
-      # 管理与 API 鉴权 Key（从 .env 或宿主环境读取，留空则自动生成）
+      # 管理与 API 鉴权 Key（从 .env 或宿主环境读取，留空则自动生成并写入
+      # data/runtime.env——容器重建后 rotate 过的 key 不再回滚）
       - MUSE2API_KEY=${MUSE2API_KEY:-}
       # 服务对外基准 URL，如 https://your-domain.com（留空则管理前端自动检测当前域名）
       - MUSE2API_PUBLIC_BASE=
-      # 超时配置（秒）
+      # 超时配置（秒）——与 config.py 默认值一致，仅作显式化
       - MUSE2API_IMAGE_TIMEOUT=240
       - MUSE2API_VIDEO_TIMEOUT=600
       - MUSE2API_CHAT_TIMEOUT=300
@@ -22,7 +23,13 @@ services:
       # 生产在此前宿主 .env 显式设置这两个值（公开模板默认回环占位）
       - MUSE2API_TETHERPOOL_URL=${MUSE2API_TETHERPOOL_URL:-http://127.0.0.1:9100}
       - MUSE2API_TETHERPOOL_GATEWAY=${MUSE2API_TETHERPOOL_GATEWAY:-http://127.0.0.1:9101}
-      - MUSE2API_TASKS_MAX=${MUSE2API_TASKS_MAX:-120}
+      # ---- 任务保留（patch22o/22r：与 config.py 默认值对齐，防配置漂移）----
+      # 历史教训：此处曾是 :-120，压测日 93 笔/天一天挤爆、11-15 档案全灭
+      # （OpenPet 409 取证断链根因）；patch22o 只改了服务器未回写仓库，
+      # 22r 补上回写。
+      - MUSE2API_TASKS_MAX=${MUSE2API_TASKS_MAX:-2000}
+      - MUSE2API_TASKS_KEEP_DAYS=${MUSE2API_TASKS_KEEP_DAYS:-30}
+      - MUSE2API_ARCHIVE_INDEX_MAX=${MUSE2API_ARCHIVE_INDEX_MAX:-50000}
       - MUSE2API_MEDIA_RETENTION_HOURS=${MUSE2API_MEDIA_RETENTION_HOURS:-0}
       - MUSE2API_BACKUP_ENABLED=${MUSE2API_BACKUP_ENABLED:-0}
       - MUSE2API_BACKUP_APP_PASS=${MUSE2API_BACKUP_APP_PASS:-}
@@ -30,3 +37,15 @@ services:
       # 持久化账号配置、任务日志及媒体文件
       - ./data:/app/data
     shm_size: '2gb' # 保证 Chromium 渲染多标签页时不因 /dev/shm 耗尽崩溃
+    # patch22r：资源上限（4C4G 共享宿主，Chromium/ffmpeg 尖峰无界会拖垮
+    # 同宿主服务且 OOM killer 命中对象不可控）
+    mem_limit: 2500m
+    memswap_limit: 2500m
+    # patch22r：健康检查（配合 restart: always 具备僵死探测——线程死锁类
+    # 故障进程不退出，原配置 restart 永不触发）
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:18610/healthz"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 90s

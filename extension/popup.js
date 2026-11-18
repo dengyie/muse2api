@@ -109,10 +109,21 @@ function applyLang() {
   });
 }
 
-function log(html, cls) {
+function log(text, cls) {
+  // patch22r：innerHTML → textContent + white-space——服务端响应原文
+  // （HTTP 错误 body 等）此前未转义直接拼 HTML，popup 运行在
+  // chrome-extension:// 特权上下文且 manifest 有全域 host_permissions
+  // + cookies 权限：http 配置下 MITM 注入即可读任意站点 cookie。
+  // 所有 log 调用方均为纯文本（\n 换行），textContent 语义等价且免疫注入。
   const el = $('log');
   el.className = 'show';
-  el.innerHTML = cls ? `<span class="${cls}">${html}</span>` : html;
+  el.style.whiteSpace = 'pre-wrap';
+  el.textContent = text;
+  if (cls) {
+    el.classList.add(cls);
+  } else {
+    el.classList.remove('bad', 'ok');
+  }
 }
 
 /* 规范化服务地址：去掉结尾斜杠和 /v1 后缀 */
@@ -205,6 +216,17 @@ async function run() {
     }
 
     log(t('读到 {n} 条 Cookie，正在上传到 {base} …', { n: names.length, base }));
+
+    // patch22r：manifest 收窄后动态申请服务地址权限（MV3 optional_host_permissions；
+    // fetch 到未授权 origin 会被浏览器拦截）。run() 由导入按钮 click 触发，
+    // 满足权限申请的用户手势要求。
+    let granted = false;
+    try {
+      granted = await chrome.permissions.request({ origins: [base + '/'] });
+    } catch (e) { /* 不支持 permissions API 的环境按原样尝试 */ }
+    if (!granted && chrome.permissions?.contains) {
+      granted = await chrome.permissions.contains({ origins: [base + '/'] });
+    }
 
     const r = await fetch(base + '/admin/accounts', {
       method: 'POST',

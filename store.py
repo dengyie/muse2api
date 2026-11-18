@@ -171,16 +171,28 @@ def _read(path: str, default):
         with open(path, encoding="utf-8") as f:
             return json.load(f)
     except Exception:  # noqa: BLE001
+        # patch22r：损坏文件改名留证 + 告警，绝不静默回空后又被下一次写入覆盖
+        # （否则 tasks.json 损坏 = 全量档案无声清零）。
+        try:
+            os.replace(path, path + ".corrupt")
+            print(f"[store] WARNING: {path} 损坏，已改名 .corrupt 留证，按空库启动",
+                  flush=True)
+        except OSError:
+            pass
         return default
 
 
 def _write(path: str, obj):
+    """原子写 + fsync（patch22r）：os.replace 原子性 + 强制刷盘，掉电场景
+    终态/幂等/归档记录不丢（对齐 QueuePolicy.save 的持久化标准）。"""
     d = os.path.dirname(path)
     os.makedirs(d, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=d)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):
@@ -423,8 +435,11 @@ class Store:
             if dropped:
                 self.tasks = {**{k: v for k, v in self.tasks.items()
                                  if k not in expired}}
-                _write(self.cfg.tasks_file, self.tasks)
+                # patch22r：写序钉死——archive_index 先落盘、tasks 后落盘。
+                # 两写之间被 kill 最坏只留多余归档条目（delete_media 可清），
+                # 绝不出现「tasks 已裁、归档未落盘」的溯源永久丢失窗口。
                 self._write_archive_index_locked()
+                _write(self.cfg.tasks_file, self.tasks)
             return dropped
         order = sorted(done.items(), key=lambda kv: kv[1].get("updated_at") or 0)
         overflow = len(live) + len(done) - limit
@@ -433,8 +448,9 @@ class Store:
             self._archive_snapshot_locked(k, done[k])  # 裁前先写归档索引
         doomed = expired | drop
         self.tasks = {**live, **{k: v for k, v in done.items() if k not in doomed}}
-        _write(self.cfg.tasks_file, self.tasks)
+        # patch22r：同上，archive 先行（见 prune 早退分支注释）
         self._write_archive_index_locked()
+        _write(self.cfg.tasks_file, self.tasks)
         return dropped + len(drop)
 
     # ---------- patch22o：归档索引 ----------
@@ -443,21 +459,31 @@ class Store:
 
         记录幂等键/请求体指纹/终态/成品文件——后续同 key 重放或成品文件
         归属查询有权威依据（OpenPet 409 取证教训：档案没了只剩 nginx 时间窗）。
+        patch22r：条数上限淘汰（archive_index_max，按 archived_at 淘最老）——
+        索引永不 prune ≠ 无限增长，否则每次终态全量重写的体积随服务年龄
+        线性膨胀（_LOCK 内写放大重演 tasks.json 旧病）。
         """
-        if t.get("video_request_key") or t.get("image_request_key"):
-            self.archive_index[tid] = {
-                "kind": t.get("kind"), "status": t.get("status"),
-                "created_at": t.get("created_at"),
-                "updated_at": t.get("updated_at"),
-                "video_request_key": t.get("video_request_key"),
-                "video_request_hash": t.get("video_request_hash"),
-                "image_request_key": t.get("image_request_key"),
-                "image_request_hash": t.get("image_request_hash"),
-                "error_code": t.get("error_code"),
-                "safe_to_resubmit": t.get("safe_to_resubmit"),
-                "result": t.get("result"),
-                "archived_at": int(time.time()),
-            }
+        if not (t.get("video_request_key") or t.get("image_request_key")):
+            return
+        self.archive_index[tid] = {
+            "kind": t.get("kind"), "status": t.get("status"),
+            "created_at": t.get("created_at"),
+            "updated_at": t.get("updated_at"),
+            "video_request_key": t.get("video_request_key"),
+            "video_request_hash": t.get("video_request_hash"),
+            "image_request_key": t.get("image_request_key"),
+            "image_request_hash": t.get("image_request_hash"),
+            "error_code": t.get("error_code"),
+            "safe_to_resubmit": t.get("safe_to_resubmit"),
+            "result": t.get("result"),
+            "archived_at": int(time.time()),
+        }
+        mx = getattr(self.cfg, "archive_index_max", 0)
+        if mx and len(self.archive_index) > mx:
+            by_age = sorted(self.archive_index.items(),
+                            key=lambda kv: kv[1].get("archived_at") or 0)
+            for k, _ in by_age[:len(self.archive_index) - mx]:
+                del self.archive_index[k]
 
     def _write_archive_index_locked(self):
         _write(self.cfg.archive_index_file, self.archive_index)
@@ -519,19 +545,28 @@ class Store:
         return self.tasks.get(tid)
 
     def list_tasks(self, limit: int = 50) -> list[dict]:
-        items = sorted(self.tasks.values(),
-                       key=lambda t: t.get("created_at") or 0, reverse=True)
+        # patch22r：快照 + 锁——原无锁 sorted 与并发建删任务交错可 RuntimeError
+        # （sorted 内部迭代 dict values）。
+        with _LOCK:
+            items = sorted(self.tasks.values(),
+                           key=lambda t: t.get("created_at") or 0, reverse=True)
         return items[:limit]
 
-    def delete_task(self, tid: str) -> bool:
+    def delete_task(self, tid: str, only_terminal: bool = False) -> bool:
+        """patch22r：only_terminal=True 时锁内复查终态——堵 del_task/clear_tasks
+        的「读状态→删」TOCTOU 窗口（queued 翻转 processing 后被删 = 付费孤儿
+        媒体 + 幂等键蒸发，patch13(F12) 想防而未堵死的操作）。"""
         with _LOCK:
-            if tid in self.tasks:
-                self._archive_snapshot_locked(tid, self.tasks[tid])
-                self._write_archive_index_locked()
-                del self.tasks[tid]
-                _write(self.cfg.tasks_file, self.tasks)
-                return True
-            return False
+            t = self.tasks.get(tid)
+            if not t:
+                return False
+            if only_terminal and (t.get("status") or "") in ("queued", "processing"):
+                return False
+            self._archive_snapshot_locked(tid, t)
+            self._write_archive_index_locked()
+            del self.tasks[tid]
+            _write(self.cfg.tasks_file, self.tasks)
+            return True
 
     def clear_tasks(self, keep: int = 0) -> int:
         with _LOCK:
@@ -543,6 +578,7 @@ class Store:
                 if tid not in keep_ids:
                     self._archive_snapshot_locked(tid, t)
             self.tasks = {k: v for k, v in self.tasks.items() if k in keep_ids}
-            _write(self.cfg.tasks_file, self.tasks)
+            # patch22r：archive 先行（与 _prune_tasks_locked 写序统一）
             self._write_archive_index_locked()
+            _write(self.cfg.tasks_file, self.tasks)
             return max(0, removed)

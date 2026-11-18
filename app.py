@@ -56,6 +56,10 @@ from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
                     _stage_before)  # patch22d: worker 失败落库/sweep 均调用；缺失即 NameError→僵尸 processing 任务
 from engine import MuseProxyError
 from store import Store, account_expiry, min_expiry
+# patch22r 命名契约钉死：本模块的 `store` 是 Store 实例（下方 110 行），
+# 模块名 store 未导入本命名空间——模块级 _read/_write 只能经 _store_read/
+# _store_write 别名使用（22o-fix 事故：误写 store._read 启动即 AttributeError
+# 重启循环）。严禁在本模块加 `import store`。
 from store import _read as _store_read, _write as _store_write
 from proxy import normalize_server, request_proxy_context, split_proxy_url
 import tetherpool
@@ -75,14 +79,19 @@ if not log.handlers:
     log.addHandler(_h)
 
 CFG.ensure_dirs()
-app = FastAPI(title="muse2api", version="1.6.11")
+# patch22r：关闭 /docs /redoc /openapi.json——管理页不依赖它们；内网可达
+# 主体不再能一张 schema 枚举完整 admin 面（侦察成本）。
+app = FastAPI(title="muse2api", version="1.6.11",
+              docs_url=None, redoc_url=None, openapi_url=None)
 
 # Cookie 助手脚本从 muse.ai 页面发起导入请求，需要放行该来源；
 # 浏览器扩展从 chrome-extension:// 发起，也一并放行。
 #
 # 这里直接放行所有来源：本服务用 Bearer Key 鉴权、不依赖 Cookie，
 # 放行来源不会带来越权风险；反之如果把来源限死，浏览器端的智能体
-# （Open WebUI / LobeChat / 各种 Web 客户端）会被 CORS 拦住用不了。
+# patch22r：CORS 接线——_origins 此前是死变量（config 的 MUSE2API_CORS_ORIGINS
+# 改了不生效）。配置非空用配置，为空保持 ["*"] 兼容 web 客户端生态（Bearer
+# 鉴权下无凭据跨域读不到受保护资源）。
 _origins = [o.strip() for o in (CFG.cors_origins or "").split(",") if o.strip()]
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 
@@ -97,7 +106,7 @@ async def _body_size_guard(request, call_next):
 
 
 app.add_middleware(CORSMiddleware,
-                   allow_origins=["*"],
+                   allow_origins=(_origins or ["*"]),
                    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
                    allow_headers=["*"],
                    expose_headers=["*"],
@@ -229,23 +238,15 @@ IMAGE_TASK_LOCK = threading.Lock()
 VIDEO_TASK_LOCK = threading.Lock()
 # patch13(F4)：幂等索引与 task 生命周期解耦——task 会被 _prune_tasks_locked
 # 裁剪（tasks_max），key 只寄生在 task 上时同 key 重放会 miss 重复计费。
-# patch22o：索引落盘 idempotency_videos.json（store._write 原子写）——纯内存
-# 索引在容器重启后即丢，重启后同 key 重放会重复建任务重复计费（OpenPet 409
-# 取证实锤的另一半断链）。
-IDEMPOTENCY_VIDEOS: dict[str, dict] = {}  # key_hash -> {task_id, request_hash, ts}
-IDEMPOTENCY_TTL = 24 * 3600
-IDEMPOTENCY_FILE = os.path.join(CFG.data_dir, "idempotency_videos.json")
-
-
-def _idem_load():
-    # 注意：本模块的 `store` 是 Store 实例（109 行），模块级 _read/_write 需显式导入
-    IDEMPOTENCY_VIDEOS.update(
-        {k: v for k, v in _store_read(IDEMPOTENCY_FILE, {}).items()
-         if time.time() - (v.get("ts") or 0) <= IDEMPOTENCY_TTL})
-
-
-def _idem_write():
-    _store_write(IDEMPOTENCY_FILE, IDEMPOTENCY_VIDEOS)
+# patch22o：索引落盘——纯内存索引容器重启后即丢，重启后同 key 重放会重复建
+# 任务重复计费（OpenPet 409 取证实锤的另一半断链）。
+# patch22r：抽取 idempotency.py 双域统一实现——视频域沿用 22o 语义；图片域补齐
+# （此前 image 只寄生 task 扫描，任务被裁后同 key 重放重复计费）；写前 purge
+# TTL 僵尸条目；check+create+register 的原子性仍由 VIDEO/IMAGE_TASK_LOCK 保证。
+from idempotency import IdempotencyIndex
+IDEMPOTENCY_VIDEOS = IdempotencyIndex(os.path.join(CFG.data_dir, "idempotency_videos.json"))
+IDEMPOTENCY_IMAGES = IdempotencyIndex(os.path.join(CFG.data_dir, "idempotency_images.json"))
+IDEMPOTENCY_TTL = IDEMPOTENCY_VIDEOS.ttl
 QUEUE_POLICY = QueuePolicy(os.path.join(CFG.data_dir, "generation-queue.json"))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -464,6 +465,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                      timeout: int, account_id: str | None):
     """Acquire a generation slot before the account lease; release both after cleanup."""
     import queue
+    from queue import Full  # patch22r：_put 断连安全入队依赖
     q = queue.Queue(maxsize=100)
     stop_event = threading.Event()
 
@@ -474,10 +476,27 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
         last_exc = None
         leased_id = None
         slot_acquired = False
+
+        def _put(kind, val, wait=5.0):
+            """patch22r：断连安全入队。原实现 `q.put` 无超时且 stop_event
+            检查在其后——SSE 客户端中途断开（生成器 close → finally → set）
+            后无人排水，队列 100 槽 ~6s 填满，worker 永久阻塞在 put 上、永不
+            进入 finally：账号租约 + GEN_LOCK 并发槽位 + 线程三重泄漏，单号
+            池下数次断连即全站生成瘫痪。改为带超时轮询 stop_event，放弃投递
+            只发生在消费者已不在的场景（消息丢弃是安全语义）。"""
+            deadline = time.monotonic() + wait
+            while True:
+                try:
+                    q.put((kind, val), timeout=0.5)
+                    return
+                except Full:
+                    if stop_event.is_set() or time.monotonic() >= deadline:
+                        return
+
         try:
             slot_acquired = GEN_LOCK.acquire(timeout=timeout)
             if not slot_acquired:
-                q.put(("error", MuseGenerationError("等待对话并发槽位超时")))
+                q.put(("error", MuseGenerationError("等待对话并发槽位超时")))  # 队列此时必空（尚未产出），直投安全
                 return
             for attempt in range(2):
                 if stop_event.is_set():
@@ -519,7 +538,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         account_id=cur_id, stop_event=stop_event
                     ):
                         yielded = True
-                        q.put(("data", chunk))
+                        _put("data", chunk)
                         if stop_event.is_set():
                             return
                     if cur_id:
@@ -542,9 +561,9 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                     if yielded:
                         break
             if last_exc is not None:
-                q.put(("error", last_exc))
+                _put("error", last_exc)
         except Exception as exc:
-            q.put(("error", exc))
+            _put("error", exc)
         finally:
             try:
                 if leased_id:
@@ -558,7 +577,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                 finally:
                     if slot_acquired:
                         GEN_LOCK.release()
-                    q.put(("done", None))
+                    _put("done", None)  # patch22r：断连后队列满也不阻塞 finally
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -1299,8 +1318,8 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
                     reference_image: str | None = None,
                     reference_images: list[str] | None = None,
-                    on_acquired=None, on_account=None, on_queue=None, on_error=None,
-                    on_stage=None) -> tuple[dict, str | None]:
+                    on_started=None, on_acquired=None, on_account=None,
+                    on_queue=None, on_error=None, on_stage=None) -> tuple[dict, str | None]:
     if not any(a.get("enabled", True) and a.get("cookies") for a in store.accounts):
         raise MuseGenerationError("没有可用的生成账号，请检查账号池")
     # patch13(F1)：排队时限独立于生成时限——上游 1.6.11 引入 QueuePolicy，
@@ -1317,7 +1336,8 @@ def _run_generation(prompt: str, kind: str, timeout: int,
         # generate 调用前唯一入账点），否则首次生成被记 2 次（现场实证）。
         return _run_generation_locked(prompt, kind, timeout, account_id,
                                       on_progress, reference_image, reference_images,
-                                      on_acquired=on_acquired, on_account=on_account,
+                                      on_started=on_started, on_acquired=on_acquired,
+                                      on_account=on_account,
                                       on_queue=on_queue, on_error=on_error,
                                       queued=queued, queue_timeout=queue_timeout,
                                       on_stage=on_stage)
@@ -1329,8 +1349,8 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
                     reference_image: str | None = None,
                     reference_images: list[str] | None = None,
-                    deadline=None, on_acquired=None, on_account=None,
-                    on_queue=None, on_error=None, queued=0.0,
+                    deadline=None, on_started=None, on_acquired=None,
+                    on_account=None, on_queue=None, on_error=None, queued=0.0,
                     queue_timeout=None, on_stage=None) -> tuple[dict, str | None]:
     if queue_timeout is None:
         queue_timeout = QUEUE_POLICY.settings()["queue_timeout"]
@@ -1356,8 +1376,12 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
     rebound = False  # 本轮是否完成过 TetherPool 重绑（单号池原地重试依据）
     base_prompt = prompt  # refusal 重写始终基于原始需求（不叠加多份指令文本）
     try:
-        if on_acquired:
-            _generation_callback(on_acquired)
+        # patch22r：on_started（账号租约获取后一次，任务置 processing/started）
+        # 与 on_acquired（每次上游发起前，attempt 入账）拆分——merge1611 合入
+        # 上游 1.6.11 时在循环前多加了一次 on_acquired 调用，video worker 的
+        # attempt 计数被双触发（generation_attempts 恒虚增 1，审计失真）。
+        if on_started:
+            _generation_callback(on_started)
         for attempt in range(3):  # 二开：2→3，refusal 自动重试
             if isinstance(last_exc, MuseModelRefusalError) or time.monotonic() >= deadline:
                 if last_exc is not None:
@@ -1441,6 +1465,9 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 if tetherpool.enabled() and tetherpool.is_managed(cur_acc.get("proxy")):
                     # patch17e（P2）：异常重绑透传账号约束（报告事件接口无
                     # constraints 形参，重绑一步带上）。
+                    # patch22r：report_proxy_error 默认只上报不重绑（rebind=False）
+                    # ——此前其内部又 acquire(force=True) 无约束覆盖绑定缓存，
+                    # 约束丢失 + binding 档案错位 + 同次失败 churn 两次出口。
                     new_proxy = TP.acquire(
                         cur_acc["id"], force=True,
                         constraints=_egress_constraints(cur_acc))
@@ -1552,6 +1579,19 @@ def _queue_image(req: ImageRequest, prompt: str, reference_images: list[str],
         sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     with IMAGE_TASK_LOCK:
         tasks = list(store.tasks.values())
+        # patch22r：image 幂等查独立索引（不被 task prune 蒸发），miss 再查
+        # task 记录兜底——对齐 video 侧 patch13(F4) 双层语义。
+        if key_hash:
+            hit = IDEMPOTENCY_IMAGES.lookup(key_hash)
+            if hit and hit.get("request_hash") == request_hash:
+                existing = store.get_task(hit["task_id"])
+                if existing:
+                    return JSONResponse(status_code=202, content={
+                        "id": existing["id"], "task_id": existing["id"],
+                        "object": "image.task", "status": existing["status"],
+                        "progress": existing.get("progress", 0),
+                        "created_at": existing["created_at"]})
+                IDEMPOTENCY_IMAGES.pop(key_hash)  # 指向的任务已不在
         if key_hash:
             for existing in tasks:
                 if existing.get("image_request_key") == key_hash:
@@ -1566,6 +1606,7 @@ def _queue_image(req: ImageRequest, prompt: str, reference_images: list[str],
                             "existing_request_hash": (existing.get("image_request_hash") or "")[:16],
                             "incoming_request_hash": request_hash[:16],
                             "conflict_at": int(time.time()),
+                            "recovery_hint": "GET /admin/idempotency?key_hash=%s 查询原任务终态（只读）" % key_hash[:16],
                         }, headers={"X-Idempotency-Conflict-Task": existing["id"]})
                     # patch20(F1)：failed 任务不算幂等命中（对齐 patch14 video
                     # 侧双保险）——同 key 重放允许重建。
@@ -1585,10 +1626,12 @@ def _queue_image(req: ImageRequest, prompt: str, reference_images: list[str],
         store.update_task(tid, api_prompt=prompt, size=req.size,
                           response_format=req.response_format, progress=0, queue_elapsed=0.0,
                           image_request_key=key_hash, image_request_hash=request_hash)
+        if key_hash:
+            IDEMPOTENCY_IMAGES.register(key_hash, tid, request_hash)
 
     def worker():
         timing = TaskTiming(store, tid)
-        def _on_acquired():
+        def _on_started():  # patch22r：started 语义回调（账号租约后一次）
             timing.acquired()
             store.update_task(tid, progress=5)
         try:
@@ -1596,7 +1639,7 @@ def _queue_image(req: ImageRequest, prompt: str, reference_images: list[str],
                 prompt, "image", req.timeout or CFG.image_timeout,
                 reference_images=reference_images,
                 on_progress=lambda p: store.update_task(tid, progress=p),
-                on_acquired=_on_acquired, on_account=timing.account,
+                on_started=_on_started, on_account=timing.account,
                 on_queue=timing.queued, on_error=timing.error)
             # Store only media metadata, not large base64 payloads or reference credentials.
             store.update_task(tid, status="completed", progress=100, account=acc_id,
@@ -1614,6 +1657,8 @@ def _queue_image(req: ImageRequest, prompt: str, reference_images: list[str],
             # 不再挡住同 key 同体重放重建。
             if task.get("image_request_key"):
                 store.update_task(tid, image_request_key=None, image_request_hash=None)
+                with IMAGE_TASK_LOCK:  # patch22r：同步清独立索引（safe 任务才可重建）
+                    IDEMPOTENCY_IMAGES.pop(task["image_request_key"], task_id=tid)
             log.warning("【生图失败】task=%s %.1fs %s", tid,
                         timing.total_elapsed, str(exc)[:120])
 
@@ -1785,14 +1830,9 @@ async def create_video(req: VideoRequest, request: Request, _=Depends(auth),
     with VIDEO_TASK_LOCK:  # patch12：check+create 原子化，堵并发同 key 双建
         # patch13(F4)：幂等查独立索引（不被 task prune 蒸发），miss 再查 task
         # 记录兜底；同 key 不同体 409。
+        # patch22r：TTL 检查/惰性清理/写前 purge 全部收敛进 IdempotencyIndex。
         if key_hash:
-            hit = IDEMPOTENCY_VIDEOS.get(key_hash)
-            # patch14(F4)：TTL 生效——超 24h 的索引项失效（防内存慢漏 +
-            # 防陈旧 hash 误命中）；IDEMPOTENCY_TTL 定义于模块级。
-            if hit and time.time() - hit.get("ts", 0) > IDEMPOTENCY_TTL:
-                IDEMPOTENCY_VIDEOS.pop(key_hash, None)
-                _idem_write()
-                hit = None
+            hit = IDEMPOTENCY_VIDEOS.lookup(key_hash)
             if hit and hit.get("request_hash") == request_hash:
                 existing = store.get_task(hit["task_id"])
                 if existing:
@@ -1800,8 +1840,7 @@ async def create_video(req: VideoRequest, request: Request, _=Depends(auth),
                             "object": "video.task", "status": existing["status"],
                             "progress": existing.get("progress", 0),
                             "created_at": existing["created_at"]}
-                del IDEMPOTENCY_VIDEOS[key_hash]  # 指向的任务已不在，索引项失效
-                _idem_write()
+                IDEMPOTENCY_VIDEOS.pop(key_hash)  # 指向的任务已不在，索引项失效
         if key_hash:
             # patch21b：task 兜底扫描只在带 Idempotency-Key 时进行——key_hash=None
             # 时会误匹配一切无 key 任务（含 image task）并错报 409
@@ -1841,17 +1880,17 @@ async def create_video(req: VideoRequest, request: Request, _=Depends(auth),
                             "progress": existing.get("progress", 0),
                             "created_at": existing["created_at"]}
         # patch13(F3)：video 是最贵上游资源，与 image 侧同款准入上限。
+        # patch22r：list() 快照——并发 image 建任务插入新键会触发
+        # RuntimeError: dictionary changed size during iteration（500）。
+        tasks_snapshot = list(store.tasks.values())
         if sum(t.get("kind") == "video" and t.get("status") in ("queued", "processing")
-               for t in store.tasks.values()) >= 8:
+               for t in tasks_snapshot) >= 8:
             raise HTTPException(429, "Video queue is full; retry later")
         task = store.create_task("video", req.prompt)
         store.update_task(task["id"], api_prompt=prompt, queue_elapsed=0.0,
                           video_request_key=key_hash, video_request_hash=request_hash)
         if key_hash:
-            IDEMPOTENCY_VIDEOS[key_hash] = {
-                "task_id": task["id"], "request_hash": request_hash,
-                "ts": time.time()}
-            _idem_write()
+            IDEMPOTENCY_VIDEOS.register(key_hash, task["id"], request_hash)
 
     store.update_task(task["id"], progress=10)
 
@@ -1863,8 +1902,12 @@ async def create_video(req: VideoRequest, request: Request, _=Depends(auth),
         acc_id = None  # patch17c：失败路径快照引用 acc_id——取得账号前抛异常
         # （锁超时/排队失败）时 except 块不能 UnboundLocalError 掩盖真实异常
 
-        def _on_acquired():
+        def _on_started():
+            """patch22r：started 语义回调（账号租约后一次）——任务置 processing。"""
             timing.acquired()
+
+        def _on_acquired():
+            """上游发起前入账（patch15(F5) 唯一入账点，patch22r 拆分后不再双触发）。"""
             attempts["n"] += 1
             attempts["events"].append(
                 {"attempt": attempts["n"], "event": "engine_call",
@@ -1876,7 +1919,8 @@ async def create_video(req: VideoRequest, request: Request, _=Depends(auth),
             def prog_cb(p):
                 store.update_task(task["id"], progress=p)
             res, acc_id = _run_generation(prompt, "video", timeout, on_progress=prog_cb,
-                                          reference_images=ref_images, on_acquired=_on_acquired,
+                                          reference_images=ref_images,
+                                          on_started=_on_started, on_acquired=_on_acquired,
                                           on_account=timing.account,
                                           on_queue=timing.queued, on_error=timing.error,
                                           on_stage=lambda s: store.update_task(
@@ -1937,10 +1981,7 @@ async def create_video(req: VideoRequest, request: Request, _=Depends(auth),
             vh = task.get("video_request_key")
             if vh and safe_to_resubmit:
                 with VIDEO_TASK_LOCK:
-                    idx = IDEMPOTENCY_VIDEOS.get(vh)
-                    if idx and idx.get("task_id") == task["id"]:
-                        IDEMPOTENCY_VIDEOS.pop(vh, None)
-                        _idem_write()
+                    IDEMPOTENCY_VIDEOS.pop(vh, task_id=task["id"])
             log.warning("【生视频失败】task=%s %.1fs %s", task["id"],
                         timing.total_elapsed, str(exc)[:120])
 
@@ -1955,7 +1996,15 @@ def get_video(task_id: str, _=Depends(auth)):
     t = store.get_task(task_id)
     if not t or t.get("kind") != "video":  # patch13(F10)：kind 过滤对齐 image 侧
         raise HTTPException(404, "task 不存在")
-    out = dict(t)
+    # patch22r：字段白名单——原 dict(t) 全量返回 prompt/api_prompt/
+    # attempt_events/quota_snapshot 等，共享同一 KEY 的多渠道场景下任何持 key
+    # 方拿到 task_id 即可读他人 prompt 全文。轮询契约只需要以下字段。
+    keep = ("id", "object", "kind", "status", "progress", "created_at",
+            "updated_at", "started_at", "completed_at", "error", "error_code",
+            "safe_to_resubmit", "generation_accepted", "stage", "account",
+            "url", "result", "video", "queue_elapsed", "total_elapsed",
+            "generation_attempts", "size", "expires_at")
+    out = {k: v for k, v in t.items() if k in keep}
     status = out.get("status")
     if status in ("succeeded", "success", "done"):
         out["status"] = "completed"
@@ -2010,21 +2059,23 @@ def lookup_idempotency(key_hash: str = "", request_hash: str = "", media: str = 
     if key_hash:
         if len(key_hash) < 16:
             raise HTTPException(400, "key_hash 前缀至少 16 位（防全键泄漏，只收前缀查询）")
-        for kh, v in IDEMPOTENCY_VIDEOS.items():
+        # patch22r：snapshot() 只读快照（原 .items() 直迭代与后台清理并发
+        # 会 RuntimeError，排障端点恰在事故现场不可用）
+        for kh, v in IDEMPOTENCY_VIDEOS.snapshot().items():
             if kh.startswith(key_hash):
                 out["idem_index"].append({"key_hash": kh[:16], "task_id": v["task_id"],
                                           "request_hash": (v.get("request_hash") or "")[:16],
                                           "ts": int(v.get("ts") or 0)})
-        out["tasks"].extend(_safe_task_view(t) for t in store.tasks.values()
+        out["tasks"].extend(_safe_task_view(t) for t in list(store.tasks.values())
                             if (t.get("video_request_key") or "").startswith(key_hash))
     if request_hash:
         if len(request_hash) < 16:
             raise HTTPException(400, "request_hash 前缀至少 16 位")
-        out["tasks"].extend(_safe_task_view(t) for t in store.tasks.values()
+        out["tasks"].extend(_safe_task_view(t) for t in list(store.tasks.values())
                             if (t.get("video_request_hash") or "").startswith(request_hash))
     if media:
         out["archive"].extend(store.lookup_archive_by_media(media))
-        out["tasks"].extend(_safe_task_view(t) for t in store.tasks.values()
+        out["tasks"].extend(_safe_task_view(t) for t in list(store.tasks.values())
                             if ((t.get("result") or {}).get("filename") == media
                                 or ((t.get("result") or {}).get("url") or "").endswith(media)))
     # 去重（多维度可能命中同一任务）
@@ -2428,6 +2479,12 @@ def _media_mime(name: str) -> str:
     return mime or "application/octet-stream"
 
 
+_MEDIA_MISS_TTL = 300.0  # patch22r：回源负缓存窗口（秒）
+_MEDIA_MISS: dict[str, float] = {}  # name -> 上次回源 miss 时刻
+_MEDIA_MISS_LOCK = threading.Lock()
+_MEDIA_MISS_MAX = 4096  # 上限防内存增长（uuid 文件名不可枚举，实际到不了）
+
+
 @app.get("/v1/media/{name}")
 def get_media(name: str):
     if "/" in name or "\\" in name or ".." in name:
@@ -2437,11 +2494,25 @@ def get_media(name: str):
         # patch22m：本地副本已被 mediabak 备份删除（delete_local）时回源远端。
         # 不落盘直接流式返回——落盘会让回源副本重新进入「备份→校验→删除」
         # 循环（重复回源 + 误导日志）；回源是低频兜底，内存返回即可。
+        # patch22r：负缓存——本端点无鉴权（播放器直链契约），原实现每个
+        # 未鉴权 404 都触发 fetch_remote 全日期目录枚举（OpenList 列目录 +
+        # 逐日 fs/get），成为低门槛资源放大攻击面。miss 记入负缓存，窗口内
+        # 直接 404 不再回源。
+        now = time.monotonic()
+        with _MEDIA_MISS_LOCK:
+            last = _MEDIA_MISS.get(name)
+            if last is not None and now - last < _MEDIA_MISS_TTL:
+                raise HTTPException(404, "文件不存在")
         data = MEDIA_BACKUPER.fetch_remote(name) if mediabak.enabled() else None
         if not data:
+            with _MEDIA_MISS_LOCK:
+                if len(_MEDIA_MISS) >= _MEDIA_MISS_MAX:
+                    _MEDIA_MISS.clear()
+                _MEDIA_MISS[name] = time.monotonic()
             raise HTTPException(404, "文件不存在")
         mime = _media_mime(name)
-        return Response(content=data, media_type=mime)
+        return Response(content=data, media_type=mime, headers={
+            "Cache-Control": "private, max-age=3600"})
     return FileResponse(p)
 
 
@@ -2984,24 +3055,36 @@ def rotate_apikey(_=Depends(auth)):
 
 
 def _persist_env(key: str, value: str):
-    """把配置写回 .env（保留其它行，原子替换）。"""
-    path = os.path.join(CFG.base_dir, ".env")
-    try:
-        with open(path, encoding="utf-8") as f:
-            lines = f.read().splitlines()
-    except OSError:
-        lines = []
-    found = False
-    for i, ln in enumerate(lines):
-        if ln.strip().startswith(key + "="):
-            lines[i] = f"{key}={value}"
-            found = True
-    if not found:
-        lines.append(f"{key}={value}")
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines).strip() + "\n")
-    os.replace(tmp, path)
+    """把配置持久化（保留其它行，原子替换）。
+
+    patch22r：写 data/runtime.env（data 卷内，容器重建不丢）+ 回写 base/.env
+    保持兼容 + 两处 chmod 0600——此前只写容器层 /app/.env（非卷），rotate 后
+    容器重建即静默回滚旧 key；且落盘权限是 umask 默认 0644。
+    """
+    targets = [os.path.join(CFG.data_dir, "runtime.env"),
+               os.path.join(CFG.base_dir, ".env")]
+    for path in targets:
+        try:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+            except OSError:
+                lines = []
+            found = False
+            for i, ln in enumerate(lines):
+                if ln.strip().startswith(key + "="):
+                    lines[i] = f"{key}={value}"
+                    found = True
+            if not found:
+                lines.append(f"{key}={value}")
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines).strip() + "\n")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+            os.chmod(path, 0o600)
+        except OSError as exc:
+            log.warning("【配置持久化】%s 写入失败: %s", path, str(exc)[:80])
 
 
 # ------------------------- 管理：Cookie 获取 -------------------------
@@ -3082,13 +3165,16 @@ def clear_tasks(payload: dict = Body(default={}), _=Depends(auth)):
     # 幂等键蒸发），跳过并计数；带 video_request_key 的任务删除时同步清
     # 幂等索引（校验归属防误删，对齐 patch14/19 失败即清语义）。
     keep = int(payload.get("keep") or 0)
-    inflight = [t["id"] for t in store.tasks.values()
-                if t.get("status") in ("queued", "processing")]
+    # patch22r：单次快照同时取 inflight 与 ids——原实现两次独立遍历之间存在
+    # TOCTOU，窗口期新建的 queued 任务会进 ids 而不在 inflight 被误删（付费
+    # 孤儿媒体）。配合 store.delete_task(only_terminal=True) 锁内复查双保险。
+    snap = list(store.tasks.values())
+    inflight = {t["id"] for t in snap
+                if t.get("status") in ("queued", "processing")}
     removed, skipped = 0, len(inflight)
-    ids = [tid for tid in store.tasks
-           if tid not in inflight]
+    ids = [t["id"] for t in snap if t["id"] not in inflight]
     keep_ids = {t["id"] for t in sorted(
-        (t for t in store.tasks.values() if t["id"] not in inflight),
+        (t for t in snap if t["id"] not in inflight),
         key=lambda t: t.get("created_at") or 0, reverse=True)[:keep]}
     for tid in ids:
         if tid in keep_ids:
@@ -3096,11 +3182,9 @@ def clear_tasks(payload: dict = Body(default={}), _=Depends(auth)):
         kh = (store.get_task(tid) or {}).get("video_request_key")
         if kh:
             with VIDEO_TASK_LOCK:
-                idx = IDEMPOTENCY_VIDEOS.get(kh)
-                if idx and idx.get("task_id") == tid:
-                    IDEMPOTENCY_VIDEOS.pop(kh, None)
-                    _idem_write()
-        if store.delete_task(tid):
+                IDEMPOTENCY_VIDEOS.pop(kh, task_id=tid)
+        # patch22r：only_terminal 锁内复查——堵「读状态→删」TOCTOU 窗口
+        if store.delete_task(tid, only_terminal=True):
             removed += 1
     return {"removed": removed, "skipped_inflight": skipped}
 
@@ -3431,15 +3515,17 @@ def _read_env_key(key: str) -> str:
     val = os.environ.get(key, "").strip()
     if val:
         return val
-    path = os.path.join(CFG.base_dir, ".env")
-    try:
-        with open(path, encoding="utf-8") as f:
-            for ln in f.read().splitlines():
-                s = ln.strip()
-                if s.startswith(key + "="):
-                    return s.split("=", 1)[1].strip()
-    except OSError:
-        pass
+    # patch22r：runtime.env（data 卷内）优先于 base/.env，与 _persist_env 对齐
+    for path in (os.path.join(CFG.data_dir, "runtime.env"),
+                 os.path.join(CFG.base_dir, ".env")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                for ln in f.read().splitlines():
+                    s = ln.strip()
+                    if s.startswith(key + "="):
+                        return s.split("=", 1)[1].strip()
+        except OSError:
+            pass
     return ""
 
 
@@ -3569,7 +3655,8 @@ def _upgrade_from_github_sync() -> dict:
     """Explicit upgrades pin one verified remote commit and preserve deployment data."""
     if MANAGED_DEPLOYMENT:
         raise HTTPException(409, "此实例通过镜像部署，请从配置的仓库分支构建并更新容器")
-    if GEN_LOCK.locked() or any(t.get("status") in ("queued", "processing") for t in store.tasks.values()):
+    if GEN_LOCK.locked() or any(t.get("status") in ("queued", "processing")
+                                for t in list(store.tasks.values())):
         raise HTTPException(409, "仍有任务排队或运行，请等待任务完成后更新")
     import requests
     import tarfile
@@ -3684,7 +3771,9 @@ async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
 
 @app.on_event("startup")
 async def _startup():
-    _idem_load()  # patch22o：幂等索引从磁盘恢复（TTL 外项丢弃）
+    # patch22r：双域幂等索引从磁盘恢复（TTL 外项丢弃；写路径已带 purge）
+    IDEMPOTENCY_VIDEOS.load()
+    IDEMPOTENCY_IMAGES.load()
     for task in list(store.tasks.values()):
         if task.get("kind") in ("image", "video") and task.get("status") in ("queued", "processing"):
             sweep_stage = task.get("stage") or "queued"
@@ -3699,16 +3788,18 @@ async def _startup():
             # 的失败任务，由调用方决策），24h TTL 兜底防陈旧项。
             with VIDEO_TASK_LOCK:
                 kh = task.get("video_request_key")
-                if (kh and interrupted_safe
-                        and IDEMPOTENCY_VIDEOS.get(kh, {}).get("task_id") == task["id"]):
-                    IDEMPOTENCY_VIDEOS.pop(kh, None)
-                    _idem_write()
+                if kh and interrupted_safe:
+                    IDEMPOTENCY_VIDEOS.pop(kh, task_id=task["id"])
     if not CFG.api_key:
         import secrets
         new_key = "m2a_" + secrets.token_hex(24)
         CFG.api_key = new_key
         _persist_env("MUSE2API_KEY", new_key)
-        log.info("🔑 未检测到 MUSE2API_KEY，已自动生成初始密钥: %s", new_key)
+        # patch22r：只打前 8 位——此前全量 key 进 stdout/docker logs（日志
+        # 外泄即密钥外泄）。完整值从 data/runtime.env 或 /admin/apikey 获取。
+        log.info("🔑 未检测到 MUSE2API_KEY，已自动生成初始密钥（前缀 %s…，"
+                 "完整值见 %s）", new_key[:8],
+                 os.path.join(CFG.data_dir, "runtime.env"))
     asyncio.create_task(_keepalive_loop())
     threading.Thread(target=MEDIA_BACKUPER.run_forever, daemon=True,
                      name="media-backup").start()
@@ -3733,7 +3824,11 @@ async def _tetherpool_heartbeat():
                 # patch17b（P2 根修）：跳过条件收紧——「非托管且有显式自建
                 # 代理」才不介入；无代理（加号即绑失败）或占位值账号允许
                 # 心跳补绑，否则"心跳自动补绑"承诺对这类账号落空。
-                if not tetherpool.is_managed(_px) and _px:
+                # patch22r：条件 bug 修正——占位值 truthy 且 is_managed=False
+                # 仍会被 continue 跳过，与注释承诺相反；补 managed_placeholder
+                # 放行（否则占位账号生成链路每次 MuseProxyError 且永不自愈）。
+                if not tetherpool.is_managed(_px) and _px \
+                        and not tetherpool.managed_placeholder(_px):
                     continue
                 aid = acc["id"]
                 if TP.cached_binding(aid):
@@ -3781,7 +3876,7 @@ def admin_video_by_key(key_hash: str, _=Depends(auth)):
     返回索引命中 + task 兜底扫描的合并结果；绝不清理冲突记录。
     key_hash = sha256(Idempotency-Key 原文)（与写入路径同算法）。"""
     with VIDEO_TASK_LOCK:
-        idx = dict(IDEMPOTENCY_VIDEOS.get(key_hash) or {})
+        idx = IDEMPOTENCY_VIDEOS.lookup(key_hash) or {}
     hits = []
     seen = set()
     if idx.get("task_id"):
@@ -3789,7 +3884,7 @@ def admin_video_by_key(key_hash: str, _=Depends(auth)):
         if t:
             hits.append(_submission_view(t))
             seen.add(t["id"])
-    for t in store.tasks.values():
+    for t in list(store.tasks.values()):
         if t.get("kind") == "video" and t.get("video_request_key") == key_hash \
                 and t["id"] not in seen:
             hits.append(_submission_view(t))
@@ -3802,7 +3897,7 @@ def admin_video_by_key(key_hash: str, _=Depends(auth)):
 @app.get("/admin/videos/by-request-hash/{request_hash}")
 def admin_video_by_hash(request_hash: str, _=Depends(auth)):
     """按请求体 hash（sha256(JSON(req.model_dump()+归一化参考图))）查询原提交。"""
-    hits = [_submission_view(t) for t in store.tasks.values()
+    hits = [_submission_view(t) for t in list(store.tasks.values())
             if t.get("kind") == "video" and t.get("video_request_hash") == request_hash]
     return {"request_hash": request_hash, "matches": hits}
 

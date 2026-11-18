@@ -189,8 +189,16 @@ class TetherPoolClient:
         return True
 
     def report_proxy_error(self, aid: str, node_name: str | None = None,
-                           event_type: str = "proxy_error") -> dict | None:
-        """生成链路代理异常 → battery 事件 + 强制重绑（opencode2api 先例）。
+                           event_type: str = "proxy_error",
+                           rebind: bool = False) -> dict | None:
+        """生成链路代理异常 → battery 事件（+可选强制重绑）。
+
+        patch22r：默认 rebind=False 只上报不再重绑——app 层已做过一次带
+        constraints 的 force acquire（patch17e），此处再 acquire(force=True)
+        会：①无约束覆盖绑定缓存（region/egress 约束静默丢失）；②store 落库
+        的 binding 档案与实际出口错位；③同次失败 churn 两次出口且 force 绕过
+        _REBIND_MIN_INTERVAL 防风暴闸门。需要本方法重绑的场景显式传 rebind=True
+        （调用方自己不再 acquire）。
 
         event_type 是自由字符串（控制面不做枚举校验）；默认 proxy_error
         如实描述"账号代理异常"，不再冒充 429 限流污染节点质量统计。
@@ -201,10 +209,10 @@ class TetherPoolClient:
             self._ctl("POST", "/v1/battery/event", json={
                 "account_id": aid, "event_type": event_type,
                 "node_name": node_name, "target_service": "muse2api",
-                "force_rebind": True}, timeout=10.0)
+                "force_rebind": bool(rebind)}, timeout=10.0)
         except Exception as exc:  # noqa: BLE001
             log.warning("【TetherPool】battery 事件上报失败: %s", str(exc)[:120])
-        return self.acquire(aid, force=True)
+        return self.acquire(aid, force=True) if rebind else None
 
     def cached_binding(self, aid: str) -> dict | None:
         """进程内绑定缓存查询（心跳用：None = 该账号当前无绑定，需要补绑）。"""

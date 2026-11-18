@@ -178,17 +178,24 @@ check("clear_tasks archives failed task too",
       and st.archive_index[tcl["id"]]["safe_to_resubmit"] is True)
 
 # ---------------- 4. 幂等索引落盘往返 ----------------
-# 独立 fake-ns 装 app.py 太重（依赖 fastapi/uvicorn 环境在这里不可控），
-# 改为结构级验证：对 app.py 源码做文本断言（沿用 test_patch22m 模式）。
+# patch22r 后实现升级为 idempotency.py 的 IdempotencyIndex 双域类；
+# 本段更新为新契约（22r 前钉的是 _idem_write/_idem_load 函数旧实现）。
 here = os.path.dirname(os.path.abspath(__file__))
 src = open(os.path.join(here, "app.py"), encoding="utf-8").read()
-check("idem flush helper exists", "def _idem_write" in src)
-check("idem load helper exists", "def _idem_load" in src)
-check("idem startup hook calls load", "_idem_load()" in src)
-check("idem registration calls write", "_idem_write()" in src)
+idem_src = open(os.path.join(here, "idempotency.py"), encoding="utf-8").read()
+check("idempotency module exists with IdempotencyIndex",
+      "class IdempotencyIndex" in idem_src and "def load" in idem_src
+      and "def register" in idem_src and "def pop" in idem_src)
+check("app wires both domains",
+      "IDEMPOTENCY_VIDEOS" in src and "IDEMPOTENCY_IMAGES" in src
+      and "IdempotencyIndex(os.path.join(CFG.data_dir" in src)
+check("startup hook loads both domains",
+      "IDEMPOTENCY_VIDEOS.load()" in src and "IDEMPOTENCY_IMAGES.load()" in src)
+check("registration via index.register",
+      "IDEMPOTENCY_VIDEOS.register(key_hash" in src)
+check("flush purges expired entries",
+      "_purged(self.data, self.ttl)" in idem_src)
 check("idem file config field", "idempotency_file" in open(os.path.join(here, "config.py"), encoding="utf-8").read())
-check("store flush on registration",
-      "IDEMPOTENCY_VIDEOS[key_hash] = {" in src and "_idem_write()" in src)
 
 print("\nPASSED %d  FAILED %d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
