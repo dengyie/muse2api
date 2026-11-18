@@ -104,7 +104,10 @@ class Config:
     chat_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_CHAT_TIMEOUT", "300")))
     max_concurrency: int = field(default_factory=lambda: max(1, int(_env("MUSE2API_CONCURRENCY", "8"))))
     # 二开（patch7）：任务历史自动修剪上限（写放大根修）；0=不限。
-    tasks_max: int = field(default_factory=lambda: max(1, int(_env("MUSE2API_TASKS_MAX", "120"))))
+    tasks_max: int = field(default_factory=lambda: max(1, int(_env("MUSE2API_TASKS_MAX", "2000"))))
+    # patch22o：已完成任务时间保留窗口（天）。0=只按条数裁。压测日 93 笔/天
+    # 会把 120 条上限一天挤爆——2026-11-15 档案全灭导致 OpenPet 409 取证断链。
+    tasks_keep_days: int = field(default_factory=lambda: max(0, int(_env("MUSE2API_TASKS_KEEP_DAYS", "30"))))
     # 二开（patch7）：媒体文件保留小时数；0=永久保留（现状默认）。
     media_retention_hours: int = field(default_factory=lambda: max(0, int(_env("MUSE2API_MEDIA_RETENTION_HOURS", "0"))))
     # 二开（patch8）：媒体云备份（MangoDrive/OpenList）。默认关闭；pass 建议宿主 .env 注入。
@@ -179,6 +182,16 @@ class Config:
     @property
     def tasks_file(self) -> str:
         return os.path.join(self.data_dir, "tasks.json")
+
+    @property
+    def archive_index_file(self) -> str:
+        """patch22o：裁剪免疫的成品溯源索引（文件名→任务档案）。"""
+        return os.path.join(self.data_dir, "archive_index.json")
+
+    @property
+    def idempotency_file(self) -> str:
+        """patch22o：视频幂等索引落盘（重启后同 key 重放仍命中原任务）。"""
+        return os.path.join(self.data_dir, "idempotency_videos.json")
 
     def ensure_dirs(self):
         for d in (self.base_dir, self.data_dir, self.media_dir, self.download_dir,

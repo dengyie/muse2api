@@ -227,9 +227,23 @@ IMAGE_TASK_LOCK = threading.Lock()
 # 在并发同 key 下互相 miss → 重复建 task 重复计费）
 VIDEO_TASK_LOCK = threading.Lock()
 # patch13(F4)：幂等索引与 task 生命周期解耦——task 会被 _prune_tasks_locked
-# 裁剪（tasks_max=120），key 只寄生在 task 上时同 key 重放会 miss 重复计费。
+# 裁剪（tasks_max），key 只寄生在 task 上时同 key 重放会 miss 重复计费。
+# patch22o：索引落盘 idempotency_videos.json（store._write 原子写）——纯内存
+# 索引在容器重启后即丢，重启后同 key 重放会重复建任务重复计费（OpenPet 409
+# 取证实锤的另一半断链）。
 IDEMPOTENCY_VIDEOS: dict[str, dict] = {}  # key_hash -> {task_id, request_hash, ts}
 IDEMPOTENCY_TTL = 24 * 3600
+IDEMPOTENCY_FILE = os.path.join(CFG.data_dir, "idempotency_videos.json")
+
+
+def _idem_load():
+    IDEMPOTENCY_VIDEOS.update(
+        {k: v for k, v in store._read(IDEMPOTENCY_FILE, {}).items()
+         if time.time() - (v.get("ts") or 0) <= IDEMPOTENCY_TTL})
+
+
+def _idem_write():
+    store._write(IDEMPOTENCY_FILE, IDEMPOTENCY_VIDEOS)
 QUEUE_POLICY = QueuePolicy(os.path.join(CFG.data_dir, "generation-queue.json"))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -1759,6 +1773,7 @@ async def create_video(req: VideoRequest, request: Request, _=Depends(auth),
             # 防陈旧 hash 误命中）；IDEMPOTENCY_TTL 定义于模块级。
             if hit and time.time() - hit.get("ts", 0) > IDEMPOTENCY_TTL:
                 IDEMPOTENCY_VIDEOS.pop(key_hash, None)
+                _idem_write()
                 hit = None
             if hit and hit.get("request_hash") == request_hash:
                 existing = store.get_task(hit["task_id"])
@@ -1768,6 +1783,7 @@ async def create_video(req: VideoRequest, request: Request, _=Depends(auth),
                             "progress": existing.get("progress", 0),
                             "created_at": existing["created_at"]}
                 del IDEMPOTENCY_VIDEOS[key_hash]  # 指向的任务已不在，索引项失效
+                _idem_write()
         if key_hash:
             # patch21b：task 兜底扫描只在带 Idempotency-Key 时进行——key_hash=None
             # 时会误匹配一切无 key 任务（含 image task）并错报 409
@@ -1803,6 +1819,7 @@ async def create_video(req: VideoRequest, request: Request, _=Depends(auth),
             IDEMPOTENCY_VIDEOS[key_hash] = {
                 "task_id": task["id"], "request_hash": request_hash,
                 "ts": time.time()}
+            _idem_write()
 
     store.update_task(task["id"], progress=10)
 
@@ -1891,6 +1908,7 @@ async def create_video(req: VideoRequest, request: Request, _=Depends(auth),
                     idx = IDEMPOTENCY_VIDEOS.get(vh)
                     if idx and idx.get("task_id") == task["id"]:
                         IDEMPOTENCY_VIDEOS.pop(vh, None)
+                        _idem_write()
             log.warning("【生视频失败】task=%s %.1fs %s", task["id"],
                         timing.total_elapsed, str(exc)[:120])
 
@@ -2986,6 +3004,7 @@ def clear_tasks(payload: dict = Body(default={}), _=Depends(auth)):
                 idx = IDEMPOTENCY_VIDEOS.get(kh)
                 if idx and idx.get("task_id") == tid:
                     IDEMPOTENCY_VIDEOS.pop(kh, None)
+                    _idem_write()
         if store.delete_task(tid):
             removed += 1
     return {"removed": removed, "skipped_inflight": skipped}
@@ -3056,6 +3075,7 @@ def delete_media(payload: dict = Body(default={}), _=Depends(auth)):
             try:
                 os.remove(p)
                 _clear_media_thumbnail(name)
+                store.remove_archive_by_media(name)  # patch22o：媒体删了索引同步删
                 removed += 1
             except OSError as e:
                 errors.append(f"{name}: {str(e)}")
@@ -3072,6 +3092,7 @@ def delete_single_media(name: str, _=Depends(auth)):
     try:
         os.remove(p)
         _clear_media_thumbnail(name)
+        store.remove_archive_by_media(name)  # patch22o：媒体删了索引同步删
         return {"status": "ok", "deleted": name}
     except OSError as e:
         raise HTTPException(500, f"删除失败: {e}")
@@ -3568,6 +3589,7 @@ async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
 
 @app.on_event("startup")
 async def _startup():
+    _idem_load()  # patch22o：幂等索引从磁盘恢复（TTL 外项丢弃）
     for task in list(store.tasks.values()):
         if task.get("kind") in ("image", "video") and task.get("status") in ("queued", "processing"):
             sweep_stage = task.get("stage") or "queued"
@@ -3585,6 +3607,7 @@ async def _startup():
                 if (kh and interrupted_safe
                         and IDEMPOTENCY_VIDEOS.get(kh, {}).get("task_id") == task["id"]):
                     IDEMPOTENCY_VIDEOS.pop(kh, None)
+                    _idem_write()
     if not CFG.api_key:
         import secrets
         new_key = "m2a_" + secrets.token_hex(24)

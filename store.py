@@ -196,6 +196,11 @@ class Store:
             if _is_pos(ce.get("hatch_vml")):
                 a["expires_at"] = int(ce["hatch_vml"])
         self.tasks: dict[str, dict] = _read(cfg.tasks_file, {})
+        # patch22o：归档索引（文件名 → 任务溯源档案）。任务库受 tasks_max 裁剪，
+        # 但成品媒体永久备份在 OpenList——没有索引时「任务档案没了 → 成品成了
+        # 无主文件」，取证只能靠时间窗猜（2026-11-18 OpenPet 409 取证实证断链）。
+        # 索引随任务完成时写入，随 delete_media 删除，永不随 prune 蒸发。
+        self.archive_index: dict[str, dict] = _read(cfg.archive_index_file, {})
 
     # ---------- 账号 ----------
     def add_account(self, cookies: dict, label: str = "",
@@ -393,20 +398,94 @@ class Store:
 
         tasks 文件每次 update 全量重写，上限受控是写放大问题的根修；
         已完成任务才可裁，进行中的（queued/processing）永远保留。
+        patch22o：先按 tasks_keep_days 淘熟（0=不按时间淘，纯条数上限），
+        再按条数裁——压测日 93 笔/天把 120 上限一天挤爆，2026-11-15 的任务
+        档案全灭导致 OpenPet 409 取证断链。
         """
         limit = self.cfg.tasks_max if keep is None else keep
-        if len(self.tasks) <= limit:
-            return 0
         done = {k: v for k, v in self.tasks.items()
                 if (v.get("status") or "").startswith(("completed", "failed"))}
         live = {k: v for k, v in self.tasks.items() if k not in done}
+        dropped = 0
+        expired = set()  # patch22o：时间淘熟集合（keep_days=0 时为空）
+        # patch22o：时间淘熟（保留窗口外的已完成任务整体移除）
+        keep_days = getattr(self.cfg, "tasks_keep_days", 0)
+        if keep_days:
+            cutoff = time.time() - keep_days * 86400
+            expired = {k for k, v in done.items()
+                       if (v.get("created_at") or 0) < cutoff}
+            if expired:
+                for k in expired:
+                    self._archive_snapshot_locked(k, done[k])  # 裁前先写归档索引
+                done = {k: v for k, v in done.items() if k not in expired}
+                dropped += len(expired)
         if len(live) + len(done) <= limit:
-            return 0
+            if dropped:
+                self.tasks = {**{k: v for k, v in self.tasks.items()
+                                 if k not in expired}}
+                _write(self.cfg.tasks_file, self.tasks)
+                self._write_archive_index_locked()
+            return dropped
         order = sorted(done.items(), key=lambda kv: kv[1].get("updated_at") or 0)
         overflow = len(live) + len(done) - limit
         drop = {k for k, _ in order[:overflow]}
-        self.tasks = {**live, **{k: v for k, v in done.items() if k not in drop}}
-        return len(drop)
+        for k in drop:
+            self._archive_snapshot_locked(k, done[k])  # 裁前先写归档索引
+        doomed = expired | drop
+        self.tasks = {**live, **{k: v for k, v in done.items() if k not in doomed}}
+        _write(self.cfg.tasks_file, self.tasks)
+        self._write_archive_index_locked()
+        return dropped + len(drop)
+
+    # ---------- patch22o：归档索引 ----------
+    def _archive_snapshot_locked(self, tid: str, t: dict):
+        """任务档案被裁/删前，把溯源要素写进 archive_index（永不 prune）。
+
+        记录幂等键/请求体指纹/终态/成品文件——后续同 key 重放或成品文件
+        归属查询有权威依据（OpenPet 409 取证教训：档案没了只剩 nginx 时间窗）。
+        """
+        if t.get("video_request_key") or t.get("image_request_key"):
+            self.archive_index[tid] = {
+                "kind": t.get("kind"), "status": t.get("status"),
+                "created_at": t.get("created_at"),
+                "updated_at": t.get("updated_at"),
+                "video_request_key": t.get("video_request_key"),
+                "video_request_hash": t.get("video_request_hash"),
+                "image_request_key": t.get("image_request_key"),
+                "image_request_hash": t.get("image_request_hash"),
+                "error_code": t.get("error_code"),
+                "safe_to_resubmit": t.get("safe_to_resubmit"),
+                "result": t.get("result"),
+                "archived_at": int(time.time()),
+            }
+
+    def _write_archive_index_locked(self):
+        _write(self.cfg.archive_index_file, self.archive_index)
+
+    def lookup_archive_by_media(self, filename: str) -> list[dict]:
+        """按成品文件名反查溯源档案（patch22o 取证接口后端）。"""
+        with _LOCK:
+            out = []
+            for tid, a in self.archive_index.items():
+                fn = ((a.get("result") or {}).get("filename")
+                      or ((a.get("result") or {}).get("url") or "").rstrip("/").rsplit("/", 1)[-1])
+                if fn == filename:
+                    out.append({"task_id": tid, **a})
+            return out
+
+    def remove_archive_by_media(self, filename: str) -> int:
+        """删除媒体时清掉对应归档索引条目（patch22o）。"""
+        with _LOCK:
+            tids = [tid for tid, a in self.archive_index.items()
+                    if (((a.get("result") or {}).get("filename")
+                         or ((a.get("result") or {}).get("url") or "").rstrip("/").rsplit("/", 1)[-1])
+                        == filename)]
+            if not tids:
+                return 0
+            for tid in tids:
+                del self.archive_index[tid]
+            self._write_archive_index_locked()
+            return len(tids)
 
     def create_task(self, kind: str, prompt: str) -> dict:
         with _LOCK:
@@ -426,6 +505,12 @@ class Store:
                 return None
             t.update(kw)
             t["updated_at"] = int(time.time())
+            # patch22o：任务带成品落终态时同步归档索引（不依赖被裁才补写）
+            if (t.get("status") or "").startswith(("completed", "failed")) \
+                    and ((t.get("result") or {}).get("filename")
+                         or (t.get("result") or {}).get("url")):
+                self._archive_snapshot_locked(tid, t)
+                self._write_archive_index_locked()
             self._prune_tasks_locked()
             _write(self.cfg.tasks_file, self.tasks)
             return t
@@ -441,6 +526,8 @@ class Store:
     def delete_task(self, tid: str) -> bool:
         with _LOCK:
             if tid in self.tasks:
+                self._archive_snapshot_locked(tid, self.tasks[tid])
+                self._write_archive_index_locked()
                 del self.tasks[tid]
                 _write(self.cfg.tasks_file, self.tasks)
                 return True
@@ -452,6 +539,10 @@ class Store:
                            key=lambda t: t.get("created_at") or 0, reverse=True)
             keep_ids = {t["id"] for t in items[:keep]}
             removed = len(self.tasks) - len(keep_ids)
+            for tid, t in self.tasks.items():
+                if tid not in keep_ids:
+                    self._archive_snapshot_locked(tid, t)
             self.tasks = {k: v for k, v in self.tasks.items() if k in keep_ids}
             _write(self.cfg.tasks_file, self.tasks)
+            self._write_archive_index_locked()
             return max(0, removed)
