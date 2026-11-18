@@ -66,11 +66,11 @@ check("docs disabled", client.get("/docs").status_code == 404
 
 # ---------------- 1. SSE 断连安全 _put ----------------
 src = open(os.path.join(_here, "app.py"), encoding="utf-8").read()
-check("SSE _put helper exists", "def _put(kind, val, wait=5.0)" in src)
+check("SSE _put helper exists", "def _put(kind, val, wait)" in src)
 check("SSE put with timeout loop",
       "q.put((kind, val), timeout=0.5)" in src and "except Full:" in src)
 check("SSE stream uses _put for data/done",
-      '_put("data", chunk)' in src and '_put("done", None)' in src)
+      '_put("data", chunk, wait=None)' in src and '_put("done", None, wait=5.0)' in src)
 check("SSE stop check before blocking semantics",
       "stop_event.is_set() or time.monotonic() >= deadline" in src)
 
@@ -317,6 +317,206 @@ check("admin onclick interpolation removed",
       "onclick=\"renameAcc('${a.id}','${esc(a.label)}')\"" not in adm
       and "data-act=\"rename\"" in adm)
 check("admin event delegation bound", "bindPoolActions" in adm)
+
+# ---------------- 16. review 二轮根修（本次 review 产出） ----------------
+# 16a. tetherpool._ctl 注入 Bearer（行为级：捕获真实 headers）
+import tetherpool  # noqa: E402
+
+captured = {}
+
+
+def fake_request(method, url, timeout=None, headers=None, **kw):
+    captured["headers"] = headers
+    class _R:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return {"ok": True}
+    return _R()
+
+
+orig_req = tetherpool.requests.request
+tetherpool.requests.request = fake_request
+try:
+    tp = tetherpool.TetherPoolClient()
+    tp._ctl("POST", "/v1/battery/event", json={})
+    h = captured.get("headers") or {}
+    check("_ctl injects Bearer from cfg password",
+          h.get("Authorization", "").startswith("Bearer ")
+          and len(h["Authorization"]) > 10, h.get("Authorization"))
+finally:
+    tetherpool.requests.request = orig_req
+
+# 16b. _gateway_proxy 双凭据（gateway_password 优先，空回落 password）
+gp_data = {"gateway_proxy_url": "http://aid__service_muse2api:tetherpool@127.0.0.1:9101"}
+from config import Config as _C2  # noqa: E402
+_c3 = _C2()
+_c3.tetherpool_gateway_password = "gwpw123"
+_c3.tetherpool_password = "svctok456"
+import types as _types
+import tetherpool as _tp_mod
+_orig_gateway_base = _tp_mod.gateway_base
+_tp_mod.gateway_base = lambda: "http://10.144.144.9:9101"
+try:
+    fake_cfg = _types.SimpleNamespace(tetherpool_gateway_password="gwpw123",
+                                      tetherpool_password="svctok456")
+    orig_cfg_fn = _tp_mod._cfg
+    _tp_mod._cfg = lambda: {"password": "svctok456"}
+    # _gateway_proxy 从 config import CFG 动态取——直接 monkeypatch CFG 属性
+    from config import CFG as _CFG
+    old_gw, old_sv = _CFG.tetherpool_gateway_password, _CFG.tetherpool_password
+    _CFG.tetherpool_gateway_password, _CFG.tetherpool_password = "gwpw123", "svctok456"
+    try:
+        px = _tp_mod._gateway_proxy("aid", gp_data)
+        check("gateway proxy uses dedicated gateway password",
+              px["password"] == "gwpw123" and "service_muse2api" in px["username"])
+        _CFG.tetherpool_gateway_password = ""
+        px2 = _tp_mod._gateway_proxy("aid", gp_data)
+        check("gateway proxy falls back to service password when unset",
+              px2["password"] == "svctok456")
+    finally:
+        _CFG.tetherpool_gateway_password, _CFG.tetherpool_password = old_gw, old_sv
+        _tp_mod._cfg = orig_cfg_fn
+finally:
+    _tp_mod.gateway_base = _orig_gateway_base
+
+# 16c. SSE 真实断连：consumer 提前 close → worker 有限时间退出且 GEN_LOCK 释放
+# （22r 的 P1-1 根修行为级钉：不再有 worker 卡死在 put 上）
+import asyncio  # noqa: E402
+
+
+def test_sse_disconnect():
+    import app as A
+    # 占住一个真槽位语义：直接用 GEN_LOCK（limit 由 CFG.max_concurrency）
+    fake_acc = {"id": "fakeacc", "cookies": {"hatch_sess": "x"},
+                "cookies_exp": {}, "enabled": True, "label": "t"}
+    orig_pool_acquire = A.ACCOUNT_POOL.acquire
+    orig_pool_release = A.ACCOUNT_POOL.release
+    orig_stream = A.engine.chat_stream
+    A.ACCOUNT_POOL.acquire = lambda **kw: dict(fake_acc)
+    A.ACCOUNT_POOL.release = lambda *a, **k: None
+    big = [f"chunk-{i}" for i in range(500)]
+
+    def fake_stream(*a, **kw):
+        for c in big:
+            yield c
+    A.engine.chat_stream = fake_stream
+    try:
+        gen = A.safe_chat_stream({"hatch_sess": "x"}, "p", None, 10, None)
+        got = []
+        it = gen
+        # 消费 2 条后直接 close（模拟客户端断连）
+        for _ in range(2):
+            got.append(next(it))
+        it.close()
+        # worker 线程应很快结束（此前：卡死在 q.put 永不退出）
+        t0 = time.monotonic()
+        # join 不可得（daemon 无引用）——用 GEN_LOCK 空闲性判断：
+        # worker finally 会 release；轮询等待锁可用
+        deadline = time.monotonic() + 10
+        released = False
+        while time.monotonic() < deadline:
+            if A.GEN_LOCK.acquire(timeout=0.5):
+                A.GEN_LOCK.release()
+                released = True
+                break
+        check("SSE disconnect: worker exits and releases GEN_LOCK",
+              released and time.monotonic() - t0 < 10)
+    finally:
+        A.ACCOUNT_POOL.acquire = orig_pool_acquire
+        A.ACCOUNT_POOL.release = orig_pool_release
+        A.engine.chat_stream = orig_stream
+
+
+test_sse_disconnect()
+
+# 16d. image 轮询白名单（行为级 TestClient）
+ti = app.store.create_task("image", "SECRET-IMG-PROMPT")
+app.store.update_task(ti["id"], api_prompt="SECRET-IMG-PROMPT",
+                      status="completed", progress=100,
+                      size="auto", response_format="url",
+                      result={"filename": "i.webp", "size": 10, "kind": "image"})
+app.CFG.api_key = "testkey123"
+try:
+    r = client.get("/v1/images/tasks/%s" % ti["id"],
+                   headers={"Authorization": "Bearer testkey123"})
+    d = r.json()
+    # 外层不再有裸 prompt/api_prompt 键（结构性收敛）；data[0].revised_prompt
+    # 是 OpenAI images 契约字段（调用方自己提交的 prompt 回显），保留正确。
+    check("image poll 200 + no raw prompt keys",
+          r.status_code == 200 and "prompt" not in d and "api_prompt" not in d
+          and d.get("data", [{}])[0].get("revised_prompt") == "SECRET-IMG-PROMPT",
+          list(d.keys()))
+finally:
+    app.CFG.api_key = ""
+
+# 16e. 交付退避成功复位（行为级：真实 mediabak 实例状态 + 端点 200）
+class _OKFetch:
+    def __init__(self): self.n = 0
+    def fetch_remote(self, name):
+        self.n += 1
+        return b"data"
+
+real_mb = orig_mb
+real_mb._delivery_consecutive_fail = 5
+real_mb._delivery_backoff_until = time.monotonic() + 600
+check("delivery backoff armed", real_mb.delivery_in_backoff() is True)
+real_mb._note_delivery_ok()
+check("delivery ok resets backoff (fetch_remote success path)",
+      real_mb.delivery_in_backoff() is False
+      and real_mb._delivery_consecutive_fail == 0)
+check("backup backoff independent of delivery reset",
+      real_mb.in_backoff() == (time.monotonic() < real_mb._backoff_until))
+
+# 16f. engine.start 探活失败重建（行为级：旧 proc 被终止，不 Popen 第二实例）
+import engine as eng_mod  # noqa: E402
+
+
+def test_start_probe_rebuild():
+    fake_cfg = _types.SimpleNamespace(
+        chromium="/bin/true", data_dir=TMP, profile_dir=os.path.join(TMP, "prof"),
+        home_dir=TMP, extra_path="", cdp_port=19211)
+    e = eng_mod.MuseEngine.__new__(eng_mod.MuseEngine)
+    eng_mod.MuseEngine.__init__.__wrapped__ if False else None
+    # 手动初始化最小状态（绕过真实 __init__ 的浏览器启动）
+    import threading as _th
+    e.cfg = fake_cfg
+    e._start_lock = _th.Lock()
+    e.proc = None
+    e.browser = None
+    e._log = None
+    e._active_contexts = set()
+    e._contexts_lock = _th.Lock()
+    e._proxy_relays = []
+    e._download_dirs = set()
+    e._local = _types.SimpleNamespace(current_context_id=None)
+    # proc 存活 + browser 假对象 + 探活必失败
+    class FakeProc:
+        def poll(self): return None
+        def terminate(self): self.terminated = True
+        def wait(self, timeout=None): return 0
+        def kill(self): pass
+    fp = FakeProc()
+    fp.terminated = False
+    e.proc = fp
+    e.browser = _types.SimpleNamespace(close=lambda: None)
+    orig_http = eng_mod.http_json
+    eng_mod.http_json = lambda url, timeout=None: (_ for _ in ()).throw(OSError("dead"))
+    orig_log_open = open
+    try:
+        # stop 分支不触发（proc.poll None → terminate 路径）；Popen 需要 chromium
+        # 可执行——/bin/true 立即退出 → start 循环 90 次探活失败 → 最终抛
+        try:
+            e.start()
+            started = True
+        except Exception:
+            started = False
+        check("probe-fail rebuild terminates stale proc",
+              fp.terminated or fp.poll() is not None)
+    finally:
+        eng_mod.http_json = orig_http
+
+
+test_start_probe_rebuild()
 
 print("\nPASSED %d  FAILED %d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

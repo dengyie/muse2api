@@ -557,6 +557,17 @@ class MuseEngine:
                     except Exception:
                         pass
                     self.browser = None
+                    # patch22r-review：旧 chromium 的 CDP 端口/user-data-dir 锁
+                    # 已不可信——不终止就继续会 Popen 第二个实例（端口占用 +
+                    # 锁竞争 + 旧进程泄漏），且对存活进程删 SingletonLock 本身
+                    # 有害。先 terminate 置 None，下方按全新启动语义走。
+                    if self.proc and self.proc.poll() is None:
+                        self.proc.terminate()
+                        try:
+                            self.proc.wait(timeout=10)
+                        except Exception:  # noqa: BLE001
+                            self.proc.kill()
+                    self.proc = None
                 else:
                     return
             env = dict(os.environ)

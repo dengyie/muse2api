@@ -305,6 +305,7 @@ class MediaBackuper:
                 return None
             if rr.status_code == 200 and rr.content:
                 self._note_ok()
+                self._note_delivery_ok()  # patch22r-review：成功即复位交付退避
                 return rr.content
             self._note_delivery_fail()
             return None
@@ -409,6 +410,14 @@ class MediaBackuper:
                 self._delivery_backoff_until = time.monotonic() + _FAIL_BACKOFF_SECS
                 log.warning("【媒体回源】连续失败 %d 次，回源退避 %d 分钟（备份扫描不受影响）",
                             self._delivery_consecutive_fail, _FAIL_BACKOFF_SECS // 60)
+
+    def _note_delivery_ok(self):
+        """patch22r-review：回源成功即复位交付退避——缺此复位时退避只能被
+        时间解除，网络恢复后 30 分钟内的所有回源仍被入口拒绝（成 404 快速
+        路径），成品「永久引用」变成无谓的不可读窗口。"""
+        with self._lock:
+            self._delivery_consecutive_fail = 0
+            self._delivery_backoff_until = 0.0
 
     def delivery_in_backoff(self) -> bool:
         with self._lock:

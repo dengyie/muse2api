@@ -56,11 +56,10 @@ from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
                     _stage_before)  # patch22d: worker 失败落库/sweep 均调用；缺失即 NameError→僵尸 processing 任务
 from engine import MuseProxyError
 from store import Store, account_expiry, min_expiry
-# patch22r 命名契约钉死：本模块的 `store` 是 Store 实例（下方 110 行），
-# 模块名 store 未导入本命名空间——模块级 _read/_write 只能经 _store_read/
-# _store_write 别名使用（22o-fix 事故：误写 store._read 启动即 AttributeError
-# 重启循环）。严禁在本模块加 `import store`。
-from store import _read as _store_read, _write as _store_write
+# 命名契约钉死：本模块的 `store` 是 Store 实例（下方 110 行），模块名 store
+# 未导入本命名空间——22o-fix 事故教训：误写 store._read（实例上找模块级
+# 函数）启动即 AttributeError 重启循环。严禁在本模块加 `import store`；
+# 模块级 _read/_write 的使用方是 idempotency.py（自持模块语义）。
 from proxy import normalize_server, request_proxy_context, split_proxy_url
 import tetherpool
 from tetherpool import MANAGED_SCHEME, TP
@@ -246,7 +245,6 @@ VIDEO_TASK_LOCK = threading.Lock()
 from idempotency import IdempotencyIndex
 IDEMPOTENCY_VIDEOS = IdempotencyIndex(os.path.join(CFG.data_dir, "idempotency_videos.json"))
 IDEMPOTENCY_IMAGES = IdempotencyIndex(os.path.join(CFG.data_dir, "idempotency_images.json"))
-IDEMPOTENCY_TTL = IDEMPOTENCY_VIDEOS.ttl
 QUEUE_POLICY = QueuePolicy(os.path.join(CFG.data_dir, "generation-queue.json"))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -477,13 +475,24 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
         leased_id = None
         slot_acquired = False
 
-        def _put(kind, val, wait=5.0):
+        def _put(kind, val, wait):
             """patch22r：断连安全入队。原实现 `q.put` 无超时且 stop_event
             检查在其后——SSE 客户端中途断开（生成器 close → finally → set）
             后无人排水，队列 100 槽 ~6s 填满，worker 永久阻塞在 put 上、永不
             进入 finally：账号租约 + GEN_LOCK 并发槽位 + 线程三重泄漏，单号
-            池下数次断连即全站生成瘫痪。改为带超时轮询 stop_event，放弃投递
-            只发生在消费者已不在的场景（消息丢弃是安全语义）。"""
+            池下数次断连即全站生成瘫痪。
+            patch22r-review：data/error 的放弃条件**只有 stop_event**（断连
+            必然置位，语义上唯一安全的丢弃时机）——带 deadline 会在「消费者
+            TCP 背压慢」场景把未断连的输出截断丢失；慢消费只是延迟，断连才
+            是终止信号。done 用短 wait（消费者已不在时丢弃无害）。"""
+            if wait is None:
+                while not stop_event.is_set():
+                    try:
+                        q.put((kind, val), timeout=0.5)
+                        return
+                    except Full:
+                        continue
+                return
             deadline = time.monotonic() + wait
             while True:
                 try:
@@ -538,7 +547,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         account_id=cur_id, stop_event=stop_event
                     ):
                         yielded = True
-                        _put("data", chunk)
+                        _put("data", chunk, wait=None)  # 只被断连终止——慢消费丢 chunk = 输出截断
                         if stop_event.is_set():
                             return
                     if cur_id:
@@ -561,9 +570,9 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                     if yielded:
                         break
             if last_exc is not None:
-                _put("error", last_exc)
+                _put("error", last_exc, wait=None)
         except Exception as exc:
-            _put("error", exc)
+            _put("error", exc, wait=None)
         finally:
             try:
                 if leased_id:
@@ -577,7 +586,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                 finally:
                     if slot_acquired:
                         GEN_LOCK.release()
-                    _put("done", None)  # patch22r：断连后队列满也不阻塞 finally
+                    _put("done", None, wait=5.0)  # done 丢弃无害：消费者已不在
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -1680,11 +1689,20 @@ def get_image_task(task_id: str, _=Depends(auth)):
     task = store.get_task(task_id)
     if not task or task.get("kind") != "image":
         raise HTTPException(404, "image task 不存在")
-    out = dict(task)
+    # patch22r-review：字段白名单对齐 video 轮询端点——原 dict(task) 全量
+    # 回显 prompt/api_prompt，共享 KEY 的多渠道场景可读他人 prompt。
+    # completed 分支的 _image_response 需要内部读 prompt 构造契约字段
+    # （revised_prompt 本就是调用方自己提交的 prompt 回显，语义不变）。
+    keep = ("id", "object", "kind", "status", "progress", "created_at",
+            "updated_at", "started_at", "completed_at", "error", "error_code",
+            "size", "response_format", "url", "result", "account",
+            "queue_elapsed", "total_elapsed", "generation_attempts",
+            "expires_at")
+    out = {k: v for k, v in task.items() if k in keep}
     if out.get("status") == "completed":
-        req = ImageRequest(prompt=out["prompt"], size=out.get("size"),
-                           response_format=out.get("response_format") or "url")
-        out.update(_image_response(req, out["result"]))
+        req = ImageRequest(prompt=task["prompt"], size=task.get("size"),
+                           response_format=task.get("response_format") or "url")
+        out.update(_image_response(req, task["result"]))
     return out
 
 
