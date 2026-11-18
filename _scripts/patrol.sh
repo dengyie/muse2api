@@ -76,13 +76,18 @@ print('  bindings:', dict(c))
 exit(1 if over else 0)" 2>/dev/null && ok "同出口 ≤5 号铁律满足" || bad "同出口超限"
 [ "${N_BIND:-0}" -ge 1 ] && ok "绑定存在（$N_BIND 个账号）" || bad "无绑定"
 
-hdr "P4 mediabak（退避/冷却计入 FAIL，--no-cost 不豁免）"
-R=$(docker logs muse2api --since 24h 2>&1 | grep -E "退避|冷却" | tail -3)
+hdr "P4 mediabak（备份硬退避计入 FAIL；mesh 冷却=已知降级 WARN，--no-cost 不豁免）"
+# patch22r：语义分级——「连续失败 N 次退避」= 备份通道真故障（FAIL）；
+# 「mesh 通道进入冷却」= patch22n 已知降级（tencent-lh 无 5244 监听，
+# public 通道健康即不影响功能，WARN）。
+R=$(docker logs muse2api --since 24h 2>&1 | grep -E "连续失败.*退避" | tail -2)
 if [ -n "$R" ]; then
-  bad "24h 内备份/回源出现退避或冷却告警（最近 3 条）：$(echo "$R" | tail -1)"
+  bad "24h 内备份连续失败触发硬退避（最近 1 条）：$(echo "$R" | tail -1)"
 else
-  ok "24h 内无退避/冷却告警"
+  ok "24h 内无备份硬退避"
 fi
+R2=$(docker logs muse2api --since 24h 2>&1 | grep -E "mesh 通道进入.*冷却|媒体回源.*退避" | tail -1)
+[ -n "$R2" ] && warn "mesh 冷却/回源退避（已知降级）：$R2" || ok "无 mesh 冷却/回源退避"
 N_MEDIA=$(docker exec muse2api sh -c 'ls /app/data/media 2>/dev/null | wc -l')
 ok "media 目录现存 $N_MEDIA 个文件（delete_local 模式应为 0~少量）"
 

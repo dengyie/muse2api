@@ -23,6 +23,9 @@ services:
       # 生产在此前宿主 .env 显式设置这两个值（公开模板默认回环占位）
       - MUSE2API_TETHERPOOL_URL=${MUSE2API_TETHERPOOL_URL:-http://127.0.0.1:9100}
       - MUSE2API_TETHERPOOL_GATEWAY=${MUSE2API_TETHERPOOL_GATEWAY:-http://127.0.0.1:9101}
+      # patch22r：控制面服务 token 化后必须显式传递（此前默认密码被 11-18
+      # IP-Pool 改造除名，容器重建后心跳 acquire 401 绑定悬空）
+      - MUSE2API_TETHERPOOL_PASSWORD=${MUSE2API_TETHERPOOL_PASSWORD:-}
       # ---- 任务保留（patch22o/22r：与 config.py 默认值对齐，防配置漂移）----
       # 历史教训：此处曾是 :-120，压测日 93 笔/天一天挤爆、11-15 档案全灭
       # （OpenPet 409 取证断链根因）；patch22o 只改了服务器未回写仓库，
