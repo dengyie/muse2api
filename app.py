@@ -310,6 +310,13 @@ def _err_type(status: int) -> str:
 @app.exception_handler(HTTPException)
 async def _http_exc(request: Request, exc: HTTPException):
     if request.url.path.startswith("/v1/"):
+        # patch22q：结构化 409 诊断——dict detail 直接透传为错误体字段
+        # （idempotency_key_conflict 带 existing_task_id/双方摘要/时间），
+        # OpenPet 机读；str detail 保持 OpenAI 兼容外壳不变。
+        if isinstance(exc.detail, dict):
+            return JSONResponse(status_code=exc.status_code,
+                                content=exc.detail,
+                                headers=getattr(exc, "headers", None))
         return JSONResponse(
             status_code=exc.status_code,
             content={"error": {"message": str(exc.detail),
@@ -1549,8 +1556,17 @@ def _queue_image(req: ImageRequest, prompt: str, reference_images: list[str],
             for existing in tasks:
                 if existing.get("image_request_key") == key_hash:
                     if existing.get("image_request_hash") != request_hash:
-                        # patch18：409 detail 带冲突 task_id，排障不必进容器翻库
-                        raise HTTPException(409, "Idempotency-Key reused with different request (existing task: %s)" % existing["id"])
+                        # patch18：409 detail 带冲突 task_id + patch22q 结构化诊断头（对齐 video 侧）
+                        raise HTTPException(409, detail={
+                            "error": "idempotency_key_conflict",
+                            "message": "Idempotency-Key reused with different request",
+                            "existing_task_id": existing["id"],
+                            "existing_status": existing.get("status"),
+                            "existing_created_at": existing.get("created_at"),
+                            "existing_request_hash": (existing.get("image_request_hash") or "")[:16],
+                            "incoming_request_hash": request_hash[:16],
+                            "conflict_at": int(time.time()),
+                        }, headers={"X-Idempotency-Conflict-Task": existing["id"]})
                     # patch20(F1)：failed 任务不算幂等命中（对齐 patch14 video
                     # 侧双保险）——同 key 重放允许重建。
                     if existing.get("status") == "failed":
@@ -1793,8 +1809,22 @@ async def create_video(req: VideoRequest, request: Request, _=Depends(auth),
             for existing in list(store.tasks.values()):
                 if existing.get("video_request_key") == key_hash:
                     if existing.get("video_request_hash") != request_hash:
-                        # patch18：409 detail 带冲突 task_id，排障不必进容器翻库
-                        raise HTTPException(409, "Idempotency-Key reused with different request (existing task: %s)" % existing["id"])
+                        # patch18：409 detail 带冲突 task_id，排障不必进容器翻库。
+                        # patch22q：结构化诊断头——OpenPet 不必解析 detail 文本，
+                        # 双方摘要/时间/已有任务终态全部可机读（不覆盖旧记录）。
+                        raise HTTPException(409, detail={
+                            "error": "idempotency_key_conflict",
+                            "message": "Idempotency-Key reused with different request",
+                            "existing_task_id": existing["id"],
+                            "existing_status": existing.get("status"),
+                            "existing_created_at": existing.get("created_at"),
+                            "existing_request_hash": (existing.get("video_request_hash") or "")[:16],
+                            "incoming_request_hash": request_hash[:16],
+                            "conflict_at": int(time.time()),
+                            "recovery_hint": "GET /admin/idempotency?scope=videos&key_hash=%s 查询原任务终态（只读）" % key_hash[:16],
+                        }, headers={"X-Idempotency-Conflict-Task": existing["id"],
+                                    "X-Idempotency-Existing-Hash": (existing.get("video_request_hash") or "")[:16],
+                                    "X-Idempotency-Incoming-Hash": request_hash[:16]})
                     # patch14(F4)：failed 任务不算幂等命中——同 key 重放允许重建
                     # （失败后清索引可能因竞态漏掉，这里双保险）。
                     # patch22：仅限 safe_to_resubmit=True（提交前失败，可证上游
@@ -1941,6 +1971,69 @@ def get_video(task_id: str, _=Depends(auth)):
         out["url"] = vurl
         if "video" not in out:
             out["video"] = {"url": vurl}
+    return out
+
+
+# ------------------------- patch22q：幂等只读核验 -------------------------
+def _safe_task_view(t: dict) -> dict:
+    """任务的安全对外视图：绝不回显 prompt/api_prompt（内容侧敏感），
+    只给幂等恢复需要的结构字段。"""
+    r = t.get("result") or {}
+    return {
+        "task_id": t["id"], "object": "video.task", "kind": t.get("kind"),
+        "status": t.get("status"), "progress": t.get("progress", 0),
+        "created_at": t.get("created_at"), "updated_at": t.get("updated_at"),
+        "key_hash": (t.get("video_request_key") or "")[:16] or None,
+        "request_hash": (t.get("video_request_hash") or "")[:16] or None,
+        "safe_to_resubmit": t.get("safe_to_resubmit"),
+        "error_code": t.get("error_code"),
+        "result": ({"filename": r.get("filename"), "bytes": r.get("bytes"),
+                    "kind": r.get("kind"), "url": r.get("url")} if r else None),
+    }
+
+
+@app.get("/admin/idempotency")
+def lookup_idempotency(key_hash: str = "", request_hash: str = "", media: str = "",
+                       _=Depends(auth)):
+    """patch22q：幂等记录只读核验（OpenPet 恢复路径，不触发任何生成）。
+
+    三种查询维度（可单用可组合，AND 语义）：
+      key_hash=<sha256 前 16 位以上前缀>  — 幂等键查询（前缀匹配防日志泄漏全键）
+      request_hash=<sha256 前 16 位以上>  — 规范化请求体摘要查询
+      media=<成品文件名>                  — 按归档索引反查（含已被 prune 的任务）
+    返回 idem 索引命中 + 任务库命中 + 归档索引命中三段，各段可为空——
+    「空」即「现存记录中没有」，不是「从未创建」。
+    """
+    if not any([key_hash, request_hash, media]):
+        raise HTTPException(400, "需要 key_hash / request_hash / media 至少一个查询维度")
+    out = {"scope": "videos", "idem_index": [], "tasks": [], "archive": []}
+    if key_hash:
+        if len(key_hash) < 16:
+            raise HTTPException(400, "key_hash 前缀至少 16 位（防全键泄漏，只收前缀查询）")
+        for kh, v in IDEMPOTENCY_VIDEOS.items():
+            if kh.startswith(key_hash):
+                out["idem_index"].append({"key_hash": kh[:16], "task_id": v["task_id"],
+                                          "request_hash": (v.get("request_hash") or "")[:16],
+                                          "ts": int(v.get("ts") or 0)})
+        out["tasks"].extend(_safe_task_view(t) for t in store.tasks.values()
+                            if (t.get("video_request_key") or "").startswith(key_hash))
+    if request_hash:
+        if len(request_hash) < 16:
+            raise HTTPException(400, "request_hash 前缀至少 16 位")
+        out["tasks"].extend(_safe_task_view(t) for t in store.tasks.values()
+                            if (t.get("video_request_hash") or "").startswith(request_hash))
+    if media:
+        out["archive"].extend(store.lookup_archive_by_media(media))
+        out["tasks"].extend(_safe_task_view(t) for t in store.tasks.values()
+                            if ((t.get("result") or {}).get("filename") == media
+                                or ((t.get("result") or {}).get("url") or "").endswith(media)))
+    # 去重（多维度可能命中同一任务）
+    seen, uniq = set(), []
+    for t in out["tasks"]:
+        if t["task_id"] not in seen:
+            seen.add(t["task_id"])
+            uniq.append(t)
+    out["tasks"] = uniq
     return out
 
 
