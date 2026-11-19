@@ -2599,7 +2599,6 @@ def add_account(req: AccountRequest, authorization: str | None = Header(default=
     # patch23：双鉴权——完整管理 KEY 走原 auth；一次性导入令牌走令牌路径
     #（只允许纯导入）。令牌不满足 Depends(auth)，故此处手动分流。
     # 权限检查（403）先于焚毁（单次有效）——拒绝服务不消耗令牌。
-    _import_token_mode = False
     if CFG.api_key:
         bearer = ""
         if authorization and authorization.lower().startswith("bearer "):
@@ -2611,7 +2610,6 @@ def add_account(req: AccountRequest, authorization: str | None = Header(default=
                 if _token_forbidden:
                     raise HTTPException(403, "一次性导入令牌仅限纯导入（不支持 "
                                              + ", ".join(_token_forbidden) + "）")
-                _import_token_mode = True
                 _import_token_consume(bearer)
             else:
                 if bearer:
