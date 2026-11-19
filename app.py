@@ -3177,6 +3177,21 @@ def cookie_helper(download: int = 0):
     return FileResponse(p, media_type="text/x-python", headers=headers)
 
 
+@app.get("/admin/userscript")
+def userscript_js():
+    """返回油猴导入脚本（Tampermonkey 安装源；v1.2.0 起支持一次性导入令牌）。
+
+    patch23：令牌模式的「网址即接入」形态——那台电脑只需浏览器装 Tampermonkey，
+    打开本 URL 安装脚本，再在 muse.ai 面板粘贴令牌即可一键入库，无需 Python。
+    """
+    p = os.path.join(BASE_DIR, "tools", "muse2api_cookie_importer.user.js")
+    if not os.path.isfile(p):
+        raise HTTPException(404, "油猴脚本缺失")
+    return Response(content=open(p, encoding="utf-8").read(),
+                    media_type="text/javascript; charset=utf-8",
+                    headers={"Cache-Control": "no-store"})
+
+
 @app.get("/admin/extension")
 def extension_zip():
     """把浏览器扩展打包成 zip 返回（推荐方式，零命令行）。
