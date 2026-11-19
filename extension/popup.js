@@ -36,7 +36,7 @@ const I18N_EN = {
   '读取并导入': 'Read and import',
   // popup.js 日志 / 状态
   '请先填服务地址': 'Please enter the service URL first',
-  '请先填 API Key': 'Please enter the API Key first',
+  '请先填 API Key': 'Please enter the API Key or import token first',
   '正在读取 muse.ai 的 Cookie…': 'Reading muse.ai cookies…',
   '无法确认当前窗口的 Cookie 存储区。请在已登录 Muse 的窗口中打开扩展，并确认已允许扩展在无痕/InPrivate 模式运行。':
     'Cannot identify the current window\'s cookie store. Open the extension in the window signed in to Muse, and allow it in Incognito/InPrivate mode if needed.',
@@ -80,6 +80,8 @@ const I18N_EN_HTML = {
 /* 服务端返回的含变量文案：[正则, 替换串] */
 const I18N_EN_PATTERNS = [
   [/^缺少核心 cookie：(.*)，该账号可能无法生成$/s, 'Missing core cookies: $1; this account may not be able to generate'],
+  [/^密钥不对（服务返回 401）。[\s\S]*$/s, 'Wrong key or token (HTTP 401).\nIf you used an m2a_imp_ one-time import token: it expires after a successful import - generate a new one on the admin page.\nIf you used an API Key, copy the correct one from the top of the Account Pool page.'],
+  [/^这个 muse\.ai 号已经在账号池里了（服务返回 409），无需重复导入。$/s, 'This muse.ai account is already in the pool (HTTP 409); no need to import again.'],
 ];
 
 function t(s, vars) {
@@ -242,8 +244,12 @@ async function run() {
     try { data = JSON.parse(text); } catch (e) { data = { raw: text }; }
 
     if (r.status === 401) {
-      return log(t('API Key 不对（服务返回 401）。\n'
-                 + '请到管理页「账号池」页顶部复制正确的 API Key。'), 'bad');
+      return log(t('密钥不对（服务返回 401）。\n'
+                 + '若填的是 m2a_imp_ 一次性导入令牌：令牌导入成功即失效，请回管理页重新生成；'
+                 + '若填的是 API Key，请到管理页「账号池」页顶部复制正确的 Key。'), 'bad');
+    }
+    if (r.status === 409) {
+      return log(t('这个 muse.ai 号已经在账号池里了（服务返回 409），无需重复导入。'), 'bad');
     }
     if (!r.ok) {
       const body = typeof data.detail === 'string' ? t(data.detail) : text.slice(0, 300);
