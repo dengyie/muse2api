@@ -15,8 +15,11 @@
     4. 关掉窗口，完事
 
 用法：
+    python get_muse_cookie.py --base http://your-server-ip:18610 --token m2a_imp_xxx
     python get_muse_cookie.py --base http://your-server-ip:18610 --key m2a_xxx
     python get_muse_cookie.py --base http://your-server-ip:18610 --key m2a_xxx --label acc-01
+
+推荐用 --token（管理页「生成一次性导入令牌」给出，单次有效，不暴露完整管理 Key）。
 
 也可以先用环境变量，省得每次敲：
     set MUSE2API_BASE=http://your-server-ip:18610     (Windows)
@@ -303,6 +306,10 @@ def upload(base: str, key: str, label: str, cookies: dict[str, dict]) -> dict:
             return json.load(r)
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:300]
+        if e.code == 401:
+            detail += "（401：令牌/Key 无效或已用过——一次性令牌导入成功即失效，请回管理页重新生成）"
+        elif e.code == 409:
+            detail += "（409：这个 muse.ai 号已经在账号池里了，无需重复导入）"
         raise RuntimeError(f"上传失败 HTTP {e.code}: {detail}") from None
     except urllib.error.URLError as e:
         raise RuntimeError(f"连不上 {base}：{e.reason}") from None
@@ -323,6 +330,8 @@ def main() -> int:
                     help="muse2api 地址，如 http://your-server-ip:18610")
     ap.add_argument("--key", default=os.environ.get("MUSE2API_KEY", ""),
                     help="API Key（m2a_ 开头）")
+    ap.add_argument("--token", default=os.environ.get("MUSE2API_IMPORT_TOKEN", ""),
+                    help="一次性导入令牌（m2a_imp_ 开头，管理页生成，单次有效）")
     ap.add_argument("--label", default="", help="账号标签，如 acc-01")
     ap.add_argument("--timeout", type=int, default=300,
                     help="等待登录的最长秒数，默认 300")
@@ -338,14 +347,17 @@ def main() -> int:
     say("=" * 66)
     say()
 
-    if not args.base or not args.key:
+    if not args.base or not (args.token or args.key):
         say("✗ 缺少参数。请这样运行：")
+        say("    python get_muse_cookie.py --base https://你的域名 --token m2a_imp_xxx")
+        say("  （命令由管理页「生成一次性导入令牌」直接给出，复制即可）")
+        say("  或者用完整 API Key：")
         say("    python get_muse_cookie.py --base https://你的域名 --key m2a_xxx")
-        say()
-        say("  （这两个值可以在 muse2api 管理页面的「接入信息」里复制）")
         return 2
     if not args.label:
         args.label = "muse-" + time.strftime("%m%d-%H%M")
+    if args.token:
+        say(f"使用一次性导入令牌（{args.token[:12]}…，导入成功即失效）")
 
     chrome = args.chrome or find_chrome()
     if not chrome:
@@ -434,7 +446,7 @@ def main() -> int:
 
         say("正在上传到 muse2api…")
         try:
-            r = upload(args.base, args.key, args.label, got)
+            r = upload(args.base, args.token or args.key, args.label, got)
         except RuntimeError as exc:
             say(f"✗ {exc}")
             say()

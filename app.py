@@ -39,6 +39,7 @@ import os
 import re
 import threading
 import time
+import secrets
 import uuid
 import zipfile
 
@@ -2594,28 +2595,56 @@ def list_accounts(_=Depends(auth)):
 
 
 @app.post("/admin/accounts")
-def add_account(req: AccountRequest, _=Depends(auth)):
+def add_account(req: AccountRequest, authorization: str | None = Header(default=None)):
+    # patch23：双鉴权——完整管理 KEY 走原 auth；一次性导入令牌走令牌路径
+    #（只允许纯导入）。令牌不满足 Depends(auth)，故此处手动分流。
+    # 权限检查（403）先于焚毁（单次有效）——拒绝服务不消耗令牌。
+    _import_token_mode = False
+    if CFG.api_key:
+        bearer = ""
+        if authorization and authorization.lower().startswith("bearer "):
+            bearer = authorization.split(None, 1)[1].strip()
+        if not bearer or not secrets.compare_digest(bearer, CFG.api_key):
+            _token_forbidden = [f for f in ("proxy", "region", "region_strict",
+                                            "egress") if f in req.model_fields_set]
+            if bearer and _import_token_active(bearer):
+                if _token_forbidden:
+                    raise HTTPException(403, "一次性导入令牌仅限纯导入（不支持 "
+                                             + ", ".join(_token_forbidden) + "）")
+                _import_token_mode = True
+                _import_token_consume(bearer)
+            else:
+                if bearer:
+                    _import_token_consume(bearer)   # 过期/无效令牌残留顺手清
+                raise HTTPException(401, "API key 无效")
     proxy = req.proxy.configuration() if req.proxy else None
     added: list[dict] = []
     seen: list[dict] = []          # 本次导入的所有 cookie，用来检查核心项是否齐全
 
-    if req.batch:
-        for label, cookies in parse_batch(req.batch):
-            acc = store.add_account(cookies, label)
+    try:
+        if req.batch:
+            for label, cookies in parse_batch(req.batch):
+                acc = store.add_account(cookies, label)
+                seen.append(cookies)
+                added.append({"id": acc["id"], "label": acc["label"],
+                              "cookie_count": len(cookies),
+                              "expires_at": acc.get("expires_at")})
+
+        cookies = dict(req.cookies)
+        if req.cookie_header:
+            cookies.update(parse_cookie_text(req.cookie_header))
+        if cookies:
+            acc = store.add_account(cookies, req.label, cookies_exp=req.expires)
             seen.append(cookies)
             added.append({"id": acc["id"], "label": acc["label"],
                           "cookie_count": len(cookies),
                           "expires_at": acc.get("expires_at")})
-
-    cookies = dict(req.cookies)
-    if req.cookie_header:
-        cookies.update(parse_cookie_text(req.cookie_header))
-    if cookies:
-        acc = store.add_account(cookies, req.label, cookies_exp=req.expires)
-        seen.append(cookies)
-        added.append({"id": acc["id"], "label": acc["label"],
-                      "cookie_count": len(cookies),
-                      "expires_at": acc.get("expires_at")})
+    except ValueError as exc:      # patch23：同 hatch_sess 重复导入
+        if str(exc).startswith("duplicate_session:"):
+            _, dup_id, dup_label = str(exc).split(":", 2)
+            raise HTTPException(409, f"该 muse.ai 会话已在账号池中（账号 "
+                                    f"{dup_label or dup_id}），请勿重复导入") from None
+        raise
 
     if not added:
         raise HTTPException(400, "未解析到任何 cookie，请检查格式")
@@ -2660,6 +2689,64 @@ def add_account(req: AccountRequest, _=Depends(auth)):
 # One short-lived receipt per account; credentials are represented only by a hash.
 _PROXY_TEST_RECEIPTS: dict[str, dict] = {}
 _PROXY_TEST_RECEIPT_TTL = 300
+
+# ------------------------- patch23：一次性导入令牌 -------------------------
+# 「登录链接式导号」机制：管理页生成短时令牌 → 用户本地脚本（tools/get_muse_cookie.py
+# --token）弹独立浏览器登录新号 → 回调 POST /admin/accounts 入库 → 令牌焚毁。
+# 设计契约：
+#   - 令牌原文只在创建响应出现一次；库内只存 sha256（凭证不落盘不回显铁律）
+#   - 单次有效 + 15 分钟 TTL；同时刻最多 1 个活跃令牌（新建即撤销旧的）
+#   - 令牌只开放「纯导入」（label + cookies）；proxy/region/enabled 等管理面
+#     字段一律 403——短时凭证不得携带账号管理权限
+#   - 校验失败统一 401 不区分过期/不存在（防枚举）；容器重启令牌即清（可接受，
+#     分钟级时效）
+_IMPORT_TOKENS: dict[str, dict] = {}   # token_sha256 -> {"expires": float, "label_hint": str}
+_IMPORT_TOKEN_TTL = 900
+
+
+def _import_token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _import_token_active(bearer: str) -> bool:
+    """只读探测：Bearer 值是否为活跃（未过期）导入令牌。不焚毁。"""
+    ent = _IMPORT_TOKENS.get(_import_token_hash(bearer))
+    return bool(ent and time.monotonic() < ent["expires"])
+
+
+def _import_token_consume(bearer: str) -> None:
+    """焚毁令牌（单次有效）；过期残留顺手清。"""
+    _IMPORT_TOKENS.pop(_import_token_hash(bearer), None)
+
+
+def _import_token_verify(bearer: str) -> bool:
+    """校验 Bearer 值是否为活跃一次性导入令牌；命中即焚毁（单次有效）。"""
+    if _import_token_active(bearer):
+        _import_token_consume(bearer)
+        return True
+    _import_token_consume(bearer)   # 无效/过期残留顺手清（防枚举同口径 401）
+    return False
+
+
+@app.post("/admin/import-token")
+def create_import_token(req: dict | None = None, _=Depends(auth)):
+    """生成一次性导入令牌（管理 KEY 鉴权）。响应含完整本地命令，令牌原文仅此一次。"""
+    body = req if isinstance(req, dict) else {}
+    label_hint = str(body.get("label") or "").strip()[:64]
+    token = "m2a_imp_" + secrets.token_hex(16)
+    _IMPORT_TOKENS.clear()            # 单活跃令牌：新建即撤销旧的
+    _IMPORT_TOKENS[_import_token_hash(token)] = {
+        "expires": time.monotonic() + _IMPORT_TOKEN_TTL,
+        "label_hint": label_hint,
+    }
+    base = (CFG.public_base or "").rstrip("/") or "http://127.0.0.1:18610"
+    cmd = f"python get_muse_cookie.py --base {base} --token {token}"
+    if label_hint:
+        cmd += f" --label {label_hint}"
+    log.info("【导入令牌】生成一次性导入令牌（label_hint=%s，15 分钟有效）",
+             label_hint or "-")
+    return {"token": token, "expires_in": _IMPORT_TOKEN_TTL,
+            "label_hint": label_hint, "command": cmd}
 
 
 def _proxy_test_identity(proxy: dict, cookies: dict | None) -> str:

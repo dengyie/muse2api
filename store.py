@@ -258,6 +258,13 @@ class Store:
     def add_account(self, cookies: dict, label: str = "",
                     cookies_exp: dict | None = None) -> dict:
         with _LOCK:
+            # patch23：同一 muse.ai 会话（hatch_sess 是唯一核心凭证）拒绝重复
+            # 导入——防同号双档案双计费。锁内比较，竞态安全。
+            sess = (cookies or {}).get("hatch_sess", "")
+            if sess:
+                for existing in self.accounts:
+                    if (existing.get("cookies") or {}).get("hatch_sess") == sess:
+                        raise ValueError(f"duplicate_session:{existing.get('id')}:{existing.get('label')}")
             aid = uuid.uuid4().hex[:12]
             exp = {k: int(v) for k, v in (cookies_exp or {}).items()
                    if _is_pos(v)}

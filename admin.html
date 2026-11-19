@@ -502,24 +502,35 @@
       </div>
 
       <div class="hint" style="margin-top:18px;padding-top:14px;border-top:1px solid var(--line)" data-i18n="cli-script-hint">
-        如果你习惯命令行、或者想用独立浏览器登录（不碰日常浏览器），也可以用这个脚本。
-        它只用 Python 标准库，<b>不需要 pip 安装任何东西</b>。
+        推荐：一键生成<b>一次性导入令牌</b>（15 分钟有效、单次成功即失效，不暴露完整密钥），
+        复制命令到本地运行 → 弹出独立浏览器窗口登录新 muse.ai 号 → 自动抓取并导入。
+        也可以下载脚本手动运行。脚本只用 Python 标准库，<b>不需要 pip 安装任何东西</b>。
       </div>
       <div class="row" style="margin-top:10px">
         <div style="flex:2">
-          <label>① 下载脚本</label>
-          <div class="copyline">
-            <a class="btnlike ghostlike" href="/admin/cookie-helper?download=1" download>⬇ get_muse_cookie.py</a>
-            <a class="btnlike ghostlike" href="/admin/cookie-helper" target="_blank">查看源码</a>
-          </div>
+          <label data-i18n="token-label-label">账号标签（可选）</label>
+          <input id="mImpLabel" placeholder="acc-02" style="width:100%">
         </div>
-        <div style="flex:4;min-width:0">
-          <label>② 运行（地址和密钥已帮你填好）</label>
-          <pre class="code" id="cmdBox"><span class="cp" onclick="copyCmd()">复制</span><span id="cmdText">正在生成命令…</span></pre>
+        <div style="flex:2">
+          <label>&nbsp;</label>
+          <button class="btnlike" onclick="genImportToken()" id="genTokBtn" data-i18n="gen-token-btn">🔐 生成一次性导入令牌</button>
         </div>
       </div>
-      <div class="hint" style="margin-top:8px">
-        ③ 在弹出的浏览器窗口里登录 muse.ai → 脚本自动抓取并上传 → 自动关窗。
+      <div style="margin-top:10px">
+        <label data-i18n="token-cmd-label">① 复制命令到本地运行（令牌已嵌入）</label>
+        <pre class="code" id="tokCmdBox" style="display:none"><span class="cp" onclick="copyText(document.getElementById('tokCmdText').textContent)">复制</span><span id="tokCmdText"></span></pre>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <div style="flex:2">
+          <label data-i18n="dl-script-label">② 或下载脚本手动运行</label>
+          <div class="copyline">
+            <a class="btnlike ghostlike" href="/admin/cookie-helper?download=1" download>⬇ get_muse_cookie.py</a>
+            <a class="btnlike ghostlike" href="/admin/cookie-helper" target="_blank" data-i18n="view-src">查看源码</a>
+          </div>
+        </div>
+      </div>
+      <div class="hint" style="margin-top:8px" data-i18n="token-flow-hint">
+        ③ 在弹出的浏览器窗口里登录 muse.ai → 脚本自动抓取并上传 → 自动关窗。同一账号重复导入会被拒绝。
       </div>
     </div>
 
@@ -1255,7 +1266,12 @@ const I18N_EN_HTML = {
   "manual-copy-hint": "\n        If you don't want to install the extension, you can copy the cookie string by hand. The key is to use\n        <b>the request headers in the \"Network\" panel</b>, not the Console: the request header's\n        <code>cookie:</code> line <b>includes the httpOnly cookies</b>, which the Console can't read.\n      ",
   "manual-copy-steps": "\n        <li>Open and log in to <code>https://muse.ai/</code> in your own browser and stay on the chat screen</li>\n        <li>Press <kbd>F12</kbd> to open developer tools and switch to the <b>Network</b> panel</li>\n        <li>Press <kbd>F5</kbd> to reload the page so the request list fills up</li>\n        <li>Click <b>any muse.ai request</b> in the list (the first one is fine)</li>\n        <li>On the right, find <b>Headers</b> → scroll down to <b>Request Headers</b></li>\n        <li>Find the line starting with <code>cookie:</code> and <b>copy the whole string after the colon</b>\n            (from <code>hatch_sess=</code> to the end of the line)</li>\n        <li>Paste it into the box under \"Option 3\" below and click Import</li>\n      ",
   "manual-copy-warn": "\n        Note: use the <code>cookie:</code> line in the <b>request headers</b>, not the \"response headers\".\n        The <code>set-cookie</code> in the response headers only has some of the cookies, so things will be missing.\n      ",
-  "cli-script-hint": "\n        If you prefer the command line, or want to log in with a separate browser (without touching your everyday browser), you can use this script.\n        It only uses the Python standard library and <b>needs nothing installed via pip</b>.\n      ",
+  "cli-script-hint": "\n        Recommended: click to generate a <b>one-time import token</b> (valid for 15 minutes, single-use, never exposes the full admin key),\n        copy the command and run it locally → a separate browser window pops up, log in with the new muse.ai account → cookies are captured and imported automatically.\n        You can also download the script and run it manually. It only uses the Python standard library and <b>needs nothing installed via pip</b>.\n      ",
+  "token-label-label": "Account label (optional)",
+  "gen-token-btn": "🔐 Generate one-time import token",
+  "token-cmd-label": "① Copy the command and run it locally (token embedded)",
+  "dl-script-label": "② Or download the script and run it manually",
+  "token-flow-hint": "③ Log in to muse.ai in the pop-up browser window → the script captures and uploads automatically → window closes. Duplicate imports of the same account are rejected.",
   "vml-role": "Optional workspace token; <b>not required for import</b>",
   "lifetime-hint": "Session validity is determined by upstream authentication. hatch_vml is an optional workspace token that may be absent or reissued; its absence or expiry alone does not prove the login is invalid. Test the account after import. Log in and import again when the upstream returns HTTP 401.",
   "docs-intro": "\n        The API follows the OpenAI style; downstream projects only need to change <code>base_url</code> and <code>api_key</code>.\n        <br>BASE URL: <code id=\"dBase\">—</code>\n      ",
@@ -1602,8 +1618,29 @@ function renderKey(){
 function toggleKey(){ keyShown = !keyShown; renderKey(); }
 
 function buildCmd(baseUrl){
+  // patch23：默认命令改为占位提示——真实命令由「生成一次性导入令牌」给出
+  //（令牌嵌入），不再把完整管理 Key 拼进命令行。
   const root = (baseUrl || location.origin).replace(/\/v1\/?$/, '').replace(/\/+$/, '');
-  return `python get_muse_cookie.py --base ${root} --key ${realKey || '你的API_KEY'} --label muse-01`;
+  return `点上方「生成一次性导入令牌」获取命令（目标：${root}）`;
+}
+
+/* patch23：一键导号——生成一次性导入令牌并展示完整命令 */
+async function genImportToken(){
+  const btn = $('genTokBtn');
+  const label = ($('mImpLabel') && $('mImpLabel').value || '').trim();
+  btn.disabled = true; const old = btn.textContent; btn.textContent = '生成中…';
+  try{
+    const d = await api('/admin/import-token', {method:'POST', body: JSON.stringify({label})});
+    let cmd = d.command || '';
+    if (label && !/--label/.test(cmd)) cmd += ` --label ${label}`;
+    $('tokCmdText').textContent = cmd;
+    $('tokCmdBox').style.display = 'block';
+    toast(`令牌已生成，${Math.round((d.expires_in||900)/60)} 分钟内有效、单次成功即失效`, 'ok');
+  }catch(e){
+    toast('生成失败：' + (e.message || e), 'warn');
+  }finally{
+    btn.disabled = false; btn.textContent = old;
+  }
 }
 
 async function copyText(v){
@@ -1622,7 +1659,6 @@ async function copyText(v){
 }
 async function copyEl(id){ await copyText($(id).value); }
 async function copyKey(){ await copyText(realKey); }
-async function copyCmd(){ await copyText($('cmdText').textContent); }
 async function copyExKey(){ await copyText($('exKey').value); }
 
 /* 扩展方案：把 BASE URL / API Key 填进页面上的复制框 */
