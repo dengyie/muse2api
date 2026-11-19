@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Muse2API Cookie 导入助手
 // @namespace    https://github.com/czg86389-hub/muse2api
-// @version      1.1.2
-// @description  在 muse.ai 网页上一键导出并推送核心 Cookie 至 muse2api 账号池，支持现代化悬浮面板、状态指示与剪贴板备份
+// @version      1.2.0
+// @description  在 muse.ai 网页上一键导出并推送核心 Cookie 至 muse2api 账号池，支持一次性导入令牌（推荐）/API Key 双模式、现代化悬浮面板、状态指示与剪贴板备份
 // @author       MUSE2API Contributors
 // @match        https://muse.ai/*
 // @match        https://*.muse.ai/*
@@ -25,7 +25,7 @@
   const ESSENTIAL = ['hatch_sess'];
 
   function loadCfg() {
-    const fallback = { base: '', key: '', label: '' };
+    const fallback = { base: '', key: '', token: '', label: '' };
     if (typeof GM_getValue === 'function') {
       return GM_getValue(STORE_KEY, fallback);
     }
@@ -125,7 +125,10 @@
   async function executePush(btnEl = null) {
     const cfg = loadCfg();
     const base = normBase(cfg.base);
+    // patch23 v1.2.0：一次性导入令牌优先于完整 API Key（令牌单次有效不暴露管理凭证）
+    const token = (cfg.token || '').trim();
     const key = (cfg.key || '').trim();
+    const cred = token || key;
     const label = (cfg.label || '').trim();
 
     if (btnEl) {
@@ -161,8 +164,8 @@
       if (btnEl) btnEl.innerHTML = '<span style="opacity:0.8">🚀 推送至服务…</span>';
 
       const headers = { 'Content-Type': 'application/json' };
-      if (key) {
-        headers['Authorization'] = 'Bearer ' + key;
+      if (cred) {
+        headers['Authorization'] = 'Bearer ' + cred;
       }
 
       const payload = JSON.stringify({ label, cookies, expires });
@@ -190,7 +193,13 @@
       try { data = JSON.parse(txt); } catch (_) {}
 
       if (r.status === 401) {
-        showToast('推送失败：API Key 错误 (401)', 'err');
+        showToast(token
+          ? '推送失败：导入令牌无效/已用过 (401)。一次性令牌导入成功即失效，请回管理页重新生成。'
+          : '推送失败：API Key 错误 (401)', 'err');
+        return;
+      }
+      if (r.status === 409) {
+        showToast('这个 muse.ai 号已经在账号池里了，无需重复导入 (409)', 'err');
         return;
       }
       if (!r.ok) {
@@ -276,7 +285,15 @@
         </div>
 
         <div style="margin-bottom:12px;">
-          <div style="font-size:11px; color:#94a3b8; margin-bottom:5px; font-weight:500;">API Key（若服务未开鉴权可留空）</div>
+          <div style="font-size:11px; color:#94a3b8; margin-bottom:5px; font-weight:500;">一次性导入令牌（推荐，管理页生成，单次有效）</div>
+          <input id="muse-cfg-token" type="password" placeholder="m2a_imp_..."
+                 value="${cfg.token || ''}"
+                 style="width:100%; box-sizing:border-box; padding:8px 11px; background:#0b1120; border:1px solid #334155;
+                        border-radius:8px; color:#f1f5f9; font-size:12px; font-family:monospace; outline:none;">
+        </div>
+
+        <div style="margin-bottom:12px;">
+          <div style="font-size:11px; color:#94a3b8; margin-bottom:5px; font-weight:500;">API Key（备选；若服务未开鉴权可留空）</div>
           <input id="muse-cfg-key" type="password" placeholder="m2a_..."
                  value="${cfg.key || ''}"
                  style="width:100%; box-sizing:border-box; padding:8px 11px; background:#0b1120; border:1px solid #334155;
@@ -325,12 +342,14 @@
 
     // 绑定事件与自动保存
     const baseIn = document.getElementById('muse-cfg-base');
+    const tokenIn = document.getElementById('muse-cfg-token');
     const keyIn = document.getElementById('muse-cfg-key');
     const labelIn = document.getElementById('muse-cfg-label');
 
     function saveInputs() {
       const newCfg = {
         base: normBase(baseIn.value),
+        token: tokenIn.value.trim(),
         key: keyIn.value.trim(),
         label: labelIn.value.trim(),
       };
@@ -339,6 +358,7 @@
     }
 
     baseIn.addEventListener('change', saveInputs);
+    tokenIn.addEventListener('change', saveInputs);
     keyIn.addEventListener('change', saveInputs);
     labelIn.addEventListener('change', saveInputs);
 
