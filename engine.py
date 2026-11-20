@@ -1333,14 +1333,17 @@ class MuseEngine:
             self.ensure_page(cookies, expires, account_id=account_id)
             self._quota_click(self._QUOTA_SETTINGS_JS, '找不到设置入口（Settings／設定／设置）')
             self._quota_click(self._QUOTA_MENU_JS, '设置菜单未出现可识别的设置项')
-            deadline = time.monotonic() + 12.0
+            # 2026-11 上游改版后 Settings 面板改为慢速懒加载：Usage 区先渲染
+            # 骨架屏（data-slot=skeleton），约 20-25s 才填入数据。等待窗口放宽
+            # 到 45s，并在骨架屏数量止跌回升前持续轮询（数据到位即提前返回）。
+            deadline = time.monotonic() + 45.0
             while True:
                 parsed = self._parse_quota(self.page.js(self._QUOTA_DIALOG_JS) or '')
                 if parsed['found']:
                     return parsed
                 if time.monotonic() >= deadline:
                     raise MuseGenerationError('额度面板未读到有效用量；旧缓存未覆盖')
-                time.sleep(0.2)
+                time.sleep(0.5)
         finally:
             self._close_page()
 
