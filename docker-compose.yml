@@ -7,7 +7,9 @@ services:
       # patch22r-review：防御位——`docker compose build` 不带 --build-arg 时
       # 镜像仍带可辨识 SHA（正式溯源走部署 SOP 的 CLI build --build-arg）。
       args:
-        BUILD_SHA: "dev"
+        # patch25：引用式——部署 SOP 用 .env 或环境变量注入真值 SHA，
+        # 未注入时防御位回落 "dev"（可辨识非正式构建）。
+        BUILD_SHA: "${MUSE2API_BUILD_SHA:-dev}"
     image: muse2api:tp
     container_name: muse2api
     restart: always
