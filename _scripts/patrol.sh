@@ -53,7 +53,7 @@ case "$CH" in
   starting)   warn "healthcheck starting（启动期）";;
   *)          bad "healthcheck: $CH";;
 esac
-SHA=$(docker exec muse2api sh -c 'echo $BUILD_SHA' 2>/dev/null)
+SHA=$(docker exec muse2api sh -c 'echo $MUSE2API_BUILD_SHA' 2>/dev/null)
 ok "镜像 BUILD_SHA=${SHA:-unknown}"
 
 hdr "P2 账号池"

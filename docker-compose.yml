@@ -44,6 +44,8 @@ services:
       - MUSE2API_MEDIA_RETENTION_HOURS=${MUSE2API_MEDIA_RETENTION_HOURS:-0}
       - MUSE2API_BACKUP_ENABLED=${MUSE2API_BACKUP_ENABLED:-0}
       - MUSE2API_BACKUP_APP_PASS=${MUSE2API_BACKUP_APP_PASS:-}
+      # patch25: mesh 通道指向 mesh 内 OpenList 真身（引用式，.env 可覆盖）
+      - MUSE2API_BACKUP_MESH_URL=${MUSE2API_BACKUP_MESH_URL:-http://127.0.0.1:5244}
     volumes:
       # 持久化账号配置、任务日志及媒体文件
       - ./data:/app/data

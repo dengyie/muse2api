@@ -271,6 +271,32 @@ def _account_proxy(account: dict):
     return account.get("proxy")
 
 
+def _rebind_on_proxy_error(acc_id: str, acc: dict) -> dict | None:
+    """patch25：代理异常 → 上报 battery 事件 + 带约束强制重绑 + binding 落库。
+
+    生成链路（_run_generation）patch17e/22r 已验证的同款语义提取成帮助函数，
+    供 attach-probe / quota / test 等直调路径复用：这些路径此前撞出口单点
+    故障只能 MuseProxyError 直接 502，要等 ip-pool 心跳自愈或人工 rebind。
+    重绑成功返回最新账号 dict（调用方可用新出口重试一次），失败返回 None。
+    """
+    if not tetherpool.enabled() or not tetherpool.is_managed(acc.get("proxy")):
+        return None
+    try:
+        new_proxy = TP.acquire(acc_id, force=True,
+                               constraints=_egress_constraints(acc))
+        TP.report_proxy_error(acc_id, event_type="proxy_error")
+        if new_proxy:
+            acc = store.update_account(acc_id, proxy=new_proxy,
+                                       binding=new_proxy.get("_binding"))
+            engine._last_http_renew.pop(acc_id, None)
+            _bind_account_proxy(acc)
+            log.info("【TetherPool】账号 %s 代理异常已重绑（探测/诊断路径）", acc_id)
+            return acc
+    except Exception as exc:  # noqa: BLE001
+        log.warning("【TetherPool】账号 %s 代理异常重绑失败: %s", acc_id, str(exc)[:120])
+    return None
+
+
 @contextmanager
 def _account_operation(aid: str):
     """Maintenance and settings share the same account lease as generation."""
@@ -2932,7 +2958,14 @@ async def test_account(aid: str, _=Depends(auth)):
         with GEN_LOCK, _account_operation(aid) as acc:
             try:
                 engine.start()
-                engine.refresh(acc["cookies"], acc.get("cookies_exp"), account_id=aid)
+                try:
+                    engine.refresh(acc["cookies"], acc.get("cookies_exp"), account_id=aid)
+                except MuseProxyError:
+                    # patch25：直调路径撞出口单点故障——上报+重绑后用新出口重试一次。
+                    acc = _rebind_on_proxy_error(aid, acc)
+                    if not acc:
+                        raise
+                    engine.refresh(acc["cookies"], acc.get("cookies_exp"), account_id=aid)
                 synced = _sync_cookies(aid)
                 quota = None
                 quota_error = None
@@ -2945,6 +2978,24 @@ async def test_account(aid: str, _=Depends(auth)):
                     else:
                         quota_error = "额度面板未读到有效数据；旧缓存未覆盖"
                         quota = None
+                except MuseProxyError as exc:
+                    # patch25：quota 读取撞出口故障也重绑重试（refresh 已成功时
+                    # 通常是出口在两次调用间抖动）。
+                    acc2 = _rebind_on_proxy_error(aid, acc)
+                    if acc2:
+                        try:
+                            quota = engine.quota(acc2["cookies"],
+                                                 acc2.get("cookies_exp"), account_id=aid)
+                            if quota.get("found"):
+                                quota["checked_at"] = int(time.time())
+                                store.update_account(aid, quota=quota)
+                            else:
+                                quota_error = "额度面板未读到有效数据；旧缓存未覆盖"
+                                quota = None
+                        except Exception as exc2:  # noqa: BLE001
+                            quota_error = f"{type(exc2).__name__}；额度缓存未更新"
+                    else:
+                        quota_error = f"{type(exc).__name__}；额度缓存未更新"
                 except Exception as exc:  # noqa: BLE001
                     quota_error = f"{type(exc).__name__}；额度缓存未更新"
                 store.mark(aid, True, "会话有效" + ("；额度读取失败" if quota_error else ""))
@@ -2977,8 +3028,17 @@ async def attach_probe(aid: str, _=Depends(auth)):
             try:
                 engine.start()
                 _mode = "reuse"
-                page = engine.ensure_page(acc["cookies"], acc.get("cookies_exp"),
-                                          account_id=aid)
+                try:
+                    page = engine.ensure_page(acc["cookies"], acc.get("cookies_exp"),
+                                              account_id=aid)
+                except MuseProxyError:
+                    # patch25：直调路径撞出口单点故障不再直接 502——上报+重绑后
+                    # 用新出口重试一次（对齐生成链路 patch17e 语义）。
+                    acc = _rebind_on_proxy_error(aid, acc)
+                    if not acc:
+                        raise
+                    page = engine.ensure_page(acc["cookies"], acc.get("cookies_exp"),
+                                              account_id=aid)
                 # patch22h 验证：先试重用页，attach 失败自动换全新页再试一次——
                 # 定位「API 进程重用页失败 / 外部进程新开页成功」的状态差异。
                 _attempts = []
@@ -3101,7 +3161,14 @@ async def query_quota(aid: str, _=Depends(auth)):
     def _probe():
         with GEN_LOCK, _account_operation(aid) as acc:
             engine.start()
-            q = engine.quota(acc["cookies"], acc.get("cookies_exp"), account_id=aid)
+            try:
+                q = engine.quota(acc["cookies"], acc.get("cookies_exp"), account_id=aid)
+            except MuseProxyError:
+                # patch25：直调路径撞出口单点故障——上报+重绑后用新出口重试一次。
+                acc = _rebind_on_proxy_error(aid, acc)
+                if not acc:
+                    raise
+                q = engine.quota(acc["cookies"], acc.get("cookies_exp"), account_id=aid)
             if not q.get("found"):
                 raise MuseGenerationError("额度面板未读到有效数据；旧缓存未覆盖")
             q["checked_at"] = int(time.time())
