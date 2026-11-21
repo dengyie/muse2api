@@ -320,23 +320,42 @@ def upload(base: str, key: str, label: str, cookies: dict[str, dict]) -> dict:
 
 
 # ---------------------------------------------------------------- 登录态探测
-def session_ok(cookies: dict[str, dict]) -> bool:
-    """带抓到的 cookie 请求 /api/session，200 = 登录态有效。
+# patch26b：探测头对齐生产 renew_session_http（engine.py）的指纹——
+# Chrome UA + Sec-Fetch 全套。cookie 来自真实 Chrome，配非浏览器 UA
+# 或缺 Sec-Fetch 易被上游风控拦成 403，误判成「未登录」。
+CHROME_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+             "(KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36")
+SESSION_PROBE_HEADERS = {
+    "User-Agent": CHROME_UA,
+    "Origin": "https://muse.ai",
+    "Referer": "https://muse.ai/thread/new",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
+}
+
+
+def session_status(cookies: dict[str, dict]) -> int:
+    """带抓到的 cookie 请求 /api/session，返回 HTTP 状态码。
 
     服务端真值判定，不猜页面跳转：匿名请求实测返回
     401 {"error":"Authentication required"}，带有效会话则 200。
-    """
+    patch26b 语义分立（对齐 renew_session_http）：200=已登录；
+    401=会话失效；403=被拒（出口/风控）——**不能据此判定 cookie 失效**；
+    0=网络错误。"""
     if "hatch_sess" not in cookies:
-        return False
+        return 401
     header = "; ".join(f"{k}={v['value']}" for k, v in cookies.items())
-    req = urllib.request.Request(SITE + "api/session",
-                                 headers={"Cookie": header,
-                                          "User-Agent": "muse2api-cookie-helper"})
+    req = urllib.request.Request(
+        SITE + "api/session",
+        headers={**SESSION_PROBE_HEADERS, "Cookie": header})
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
-            return r.status == 200
-    except Exception:                              # noqa: BLE001  401/网络错=未登录
-        return False
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception:                              # noqa: BLE001
+        return 0                                   # 网络错 ≠ 未登录
 
 
 def fmt_ts(ts: int) -> str:
@@ -446,6 +465,8 @@ def main() -> int:
         deadline = time.time() + args.timeout
         got: dict[str, dict] = {}
         last_note = 0.0
+        last_probe = 0.0          # patch26b：探测限频（10s 一次）
+        probe_status = -1         # 最近一次 /api/session 探测状态码
         while time.time() < deadline:
             try:
                 got = read_cookies(ws)
@@ -458,13 +479,25 @@ def main() -> int:
             if len(have) == len(ESSENTIAL):
                 # patch26：cookie 在手 + 服务端确认登录态才动手。旧的失效
                 # cookie 挂在 profile 里时单看「有 hatch_sess」会误判完成。
-                if session_ok(got):
-                    break
+                # patch26b：探测限频 10s 一次（防止失效会话挂满 300s 时
+                # 对上游打 ~150 次请求），失败也计入提示节流。
                 now = time.time()
+                if now - last_probe >= 10:
+                    last_probe = now
+                    probe_status = session_status(got)
+                if probe_status == 200:
+                    break
                 if now - last_note > 10:
                     last_note = now
                     left = int(deadline - now)
-                    say(f"  有旧 cookie 但会话已失效，请在窗口里重新登录（剩余 {left}s）")
+                    if probe_status == 403:
+                        # 对齐 renew_session_http 语义：403=被拒，不能判定
+                        # cookie 失效，多半是出口/风控，别误导用户重登。
+                        say(f"  探测被拒 (403)——多为出口/风控问题，cookie 未必失效（剩余 {left}s）")
+                    elif probe_status == 0:
+                        say(f"  探测网络错误，重试中…（剩余 {left}s）")
+                    else:
+                        say(f"  有旧 cookie 但会话已失效，请在窗口里重新登录（剩余 {left}s）")
             else:
                 now = time.time()
                 if now - last_note > 5:
