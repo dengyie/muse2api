@@ -102,12 +102,19 @@ def reset_calls():
     CALLS["report"] = []
 
 
+# patch25c（F1）：记录 close_current_page 调用
+_CLOSED = []
+app.engine.close_current_page = lambda: _CLOSED.append(1)
+
+
 acc = add_acc()
 reset_calls()
+_CLOSED.clear()
 out = app._rebind_on_proxy_error(acc["id"], acc)
 check("1.1 托管+启用→重绑返回账号", out is not None, repr(out)[:80])
 check("1.2 acquire(force=True) 带约束", CALLS["acquire"] and CALLS["acquire"][0][1] is True)
 check("1.3 上报 proxy_error 事件", CALLS["report"] and CALLS["report"][0][1] == "proxy_error")
+check("1.3b 重绑成功关旧页（review F1）", len(_CLOSED) == 1, str(_CLOSED))
 stored = app.store.get_account(acc["id"])
 check("1.4 store proxy 已更新", stored["proxy"]["username"] == NEW_PROXY["username"])
 check("1.5 binding 档案同步", (stored.get("binding") or {}).get("node_id") == "azure-india-warp-42")
@@ -132,12 +139,14 @@ app.tetherpool.enabled = lambda: True
 
 # acquire 失败 → None 且异常被吞（不劣化）
 reset_calls()
+_CLOSED.clear()
 class _TPFail(_TPStub):
     def acquire(self, aid, force=False, constraints=None):
         return None
 app.TP = _TPFail()
 out4 = app._rebind_on_proxy_error(acc["id"], acc)
 check("1.10 acquire 无果→None 不抛", out4 is None)
+check("1.11 acquire 无果不关页（页属调用方现场）", not _CLOSED, str(_CLOSED))
 app.TP = _TPStub()
 
 # ---------------- 2. attach-probe 自愈 ----------------

@@ -286,6 +286,11 @@ def _rebind_on_proxy_error(acc_id: str, acc: dict) -> dict | None:
                                constraints=_egress_constraints(acc))
         TP.report_proxy_error(acc_id, event_type="proxy_error")
         if new_proxy:
+            # patch25c（review F1）：重绑成功先关旧页——异常发生时页可能还
+            # 挂在故障出口上（attach-probe 首试 ensure_page 半死页），不关会
+            # 被重试路径复用再撞一次；对齐生成链路 MuseProxyError 分支的
+            # close_current_page 语义。_close_page 幂等（page=None 跳过）。
+            engine.close_current_page()
             acc = store.update_account(acc_id, proxy=new_proxy,
                                        binding=new_proxy.get("_binding"))
             engine._last_http_renew.pop(acc_id, None)
