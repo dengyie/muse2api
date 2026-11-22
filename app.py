@@ -3692,15 +3692,34 @@ def _admin_html() -> str:
                 "<p>接口可用：<code>/v1/images/generations</code>、"
                 "<code>/v1/videos</code></p></body>")
 
+def _admin_html_injected() -> str:
+    """patch27b：管理页 KEY 自动注入——KEY 织入页面 JS，内网用户免手填。
+
+    信任域论证：本服务无公网入口（公网仅 22+48721），管理页只经 mesh 内网
+    nginx（10.144.144.1:18610）触达，与 .env 明文存 KEY 同一信任域；注入的
+    KEY 不落 localStorage 之外的任何新位置（页面拿到后仍走原 KEY 内存变量），
+    URL 无 ?key= 残留（patch22r 红线保持）。无 KEY 部署时原样返回零变化。
+    """
+    html = _admin_html()
+    if not CFG.api_key:
+        return html
+    marker = "let KEY = localStorage.getItem(KEY_STORE) || new URLSearchParams(location.search).get('key') || '';"
+    inject = ("let KEY = localStorage.getItem(KEY_STORE) "
+              "|| new URLSearchParams(location.search).get('key') "
+              f"|| {json.dumps(CFG.api_key)};")
+    if marker in html:
+        return html.replace(marker, inject, 1)
+    return html
+
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return HTMLResponse(_admin_html(), headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"})
+    return HTMLResponse(_admin_html_injected(), headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"})
 
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page():
-    return HTMLResponse(_admin_html(), headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"})
+    return HTMLResponse(_admin_html_injected(), headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"})
 
 
 
