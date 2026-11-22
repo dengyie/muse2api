@@ -20,7 +20,9 @@ services:
       # data/runtime.env——容器重建后 rotate 过的 key 不再回滚）
       - MUSE2API_KEY=${MUSE2API_KEY:-}
       # 服务对外基准 URL，如 https://your-domain.com（留空则管理前端自动检测当前域名）
-      - MUSE2API_PUBLIC_BASE=
+      # patch27b：改引用式——原硬编码空值会静默覆盖宿主 .env，导入令牌/登录
+      # 链接的 base 回落 127.0.0.1，其他设备打不开（2026-11-23 实弹实证）
+      - MUSE2API_PUBLIC_BASE=${MUSE2API_PUBLIC_BASE:-}
       # 超时配置（秒）——与 config.py 默认值一致，仅作显式化
       - MUSE2API_IMAGE_TIMEOUT=240
       - MUSE2API_VIDEO_TIMEOUT=600
