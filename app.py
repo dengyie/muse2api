@@ -2876,6 +2876,16 @@ async def remote_login_ws(ws: WebSocket, token: str = ""):
     # label 取令牌生成时的 label_hint（管理页填的账号标签），无则落 ID
     _tok_ent = _IMPORT_TOKENS.get(_import_token_hash(token)) or {}
     sess = RemoteLoginSession(aid, label=str(_tok_ent.get("label_hint") or ""))
+    # patch27（自查根修）：浏览器未预热（刚重启/空闲回收）时主动启动——
+    # start() 自带 _start_lock + 探活早退，幂等；失败则报错收口不悬空。
+    if getattr(engine, "browser", None) is None:
+        try:
+            await _aio.get_running_loop().run_in_executor(None, engine.start)
+        except Exception as exc:                       # noqa: BLE001
+            await ws.send_json({"t": "error", "msg": f"浏览器启动失败：{str(exc)[:80]}"})
+            await ws.close()
+            _import_token_consume(token)
+            return
     _frames: _aio.Queue = _aio.Queue(maxsize=8)        # 背压：丢旧帧保实时
     _inputs: _aio.Queue = _aio.Queue()
     _loop = _aio.get_running_loop()
