@@ -1425,7 +1425,14 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
         if on_started:
             _generation_callback(on_started)
         for attempt in range(3):  # 二开：2→3，refusal 自动重试
-            if isinstance(last_exc, MuseModelRefusalError) or time.monotonic() >= deadline:
+            # patch28：合并 upstream 1.6.11 时顶部曾加
+            # isinstance(last_exc, MuseModelRefusalError) 短路——只回文本失败在
+            # 下一轮循环开头直接 raise，导致下方 refusal 改写重试分支成死代码
+            # （生产实证：改写日志计数 0，3 笔只回文本全 attempts=1 落终态）。
+            # 回归 fork 原生语义：仅 deadline 终止；refusal 落到 attempt>0 分支
+            # 改写 prompt 重发（issue #52 随机行为），upstream_attachment_broken
+            # 仍在该分支内快速失败不烧重试链。
+            if time.monotonic() >= deadline:
                 if last_exc is not None:
                     raise last_exc
                 raise MuseGenerationError("生成时限已到（不含排队时间），已停止等待")
