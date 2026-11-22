@@ -43,7 +43,8 @@ import secrets
 import uuid
 import zipfile
 
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
+from fastapi import (Body, Depends, FastAPI, Header, HTTPException, Request,
+                     WebSocket, WebSocketDisconnect)
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                Response, StreamingResponse)
@@ -2638,6 +2639,10 @@ def add_account(req: AccountRequest, authorization: str | None = Header(default=
             _token_forbidden = [f for f in ("proxy", "region", "region_strict",
                                             "egress") if f in req.model_fields_set]
             if bearer and _import_token_active(bearer):
+                if _import_token_mode(bearer) != "cli":
+                    # patch27：URL 令牌不能当 CLI 导入令牌用（mode 隔离防串用；
+                    # 403 先于焚毁——登录链接正在使用中，不能被烧掉）
+                    raise HTTPException(403, "该令牌是远程登录用途，不能用于命令行导入")
                 if _token_forbidden:
                     raise HTTPException(403, "一次性导入令牌仅限纯导入（不支持 "
                                              + ", ".join(_token_forbidden) + "）")
@@ -2767,6 +2772,7 @@ def create_import_token(req: dict | None = None, _=Depends(auth)):
     _IMPORT_TOKENS[_import_token_hash(token)] = {
         "expires": time.monotonic() + _IMPORT_TOKEN_TTL,
         "label_hint": label_hint,
+        "mode": "cli",
     }
     base = (CFG.public_base or "").rstrip("/") or "http://127.0.0.1:18610"
     cmd = f"python get_muse_cookie.py --base {base} --token {token}"
@@ -2776,6 +2782,226 @@ def create_import_token(req: dict | None = None, _=Depends(auth)):
              label_hint or "-")
     return {"token": token, "expires_in": _IMPORT_TOKEN_TTL,
             "label_hint": label_hint, "command": cmd}
+
+
+# ------------------------- patch27：远程浏览器导号（CDP 串流） -------------------------
+# 「真裸 URL」导号第三入口：管理页生成登录链接 → 用户在任意浏览器打开 →
+# muse2api 容器内 chromium 建隔离 context（premium 出口）→ CDP 串流画面 +
+# 键鼠回传 → 用户直接在服务器浏览器登录 muse.ai → cookie 天然落服务器 →
+# 自动入库（proxy/binding 同步写入，登录 IP = 账号持久出口）→ 令牌焚毁。
+# 与命令行令牌共用存储，但用途标记隔离（mode: cli / url，防串用——
+# CLI 令牌不能开登录页，URL 令牌不能回调 CLI 脚本端点之外的管理面）。
+_REMOTE_LOGINS: dict[str, "object"] = {}   # token_sha256 -> RemoteLoginSession
+_REMOTE_LOGIN_LOCK = threading.Lock()
+
+
+def _import_token_mode(bearer: str) -> str | None:
+    """活跃令牌的用途标记（"cli" / "url"）；非活跃返回 None。不焚毁。"""
+    ent = _IMPORT_TOKENS.get(_import_token_hash(bearer))
+    if not ent or time.monotonic() >= ent["expires"]:
+        return None
+    return ent.get("mode", "cli")
+
+
+@app.post("/admin/import-login-url")
+def create_login_url(req: dict | None = None, _=Depends(auth)):
+    """生成远程登录链接（管理 KEY 鉴权）。返回 URL（含令牌原文，仅此一次）。
+
+    与 create_import_token 同一令牌池（单活跃互斥：新建即撤销旧令牌，
+    无论用途），但 mode="url"——只能开登录页，不能给 CLI 脚本用。
+    """
+    body = req if isinstance(req, dict) else {}
+    label_hint = str(body.get("label") or "").strip()[:64]
+    token = "m2a_imp_" + secrets.token_hex(16)
+    _IMPORT_TOKENS.clear()            # 单活跃令牌（跨用途互斥）：新建即撤销旧的
+    _IMPORT_TOKENS[_import_token_hash(token)] = {
+        "expires": time.monotonic() + _IMPORT_TOKEN_TTL,
+        "label_hint": label_hint,
+        "mode": "url",
+    }
+    base = (CFG.public_base or "").rstrip("/") or "http://127.0.0.1:18610"
+    url = f"{base}/admin/remote-login?token={token}"
+    log.info("【远程登录】生成登录链接（label_hint=%s，15 分钟有效）", label_hint or "-")
+    return {"url": url, "expires_in": _IMPORT_TOKEN_TTL, "label_hint": label_hint}
+
+
+@app.get("/admin/remote-login", response_class=HTMLResponse)
+def remote_login_page(token: str = ""):
+    """登录控制页：令牌 active 校验（不焚毁，校验后仍可被 WS 复用）。"""
+    if not token or not _import_token_active(token):
+        raise HTTPException(401, "登录链接无效或已过期（15 分钟有效），请在管理页重新生成")
+    if _import_token_mode(token) != "url":
+        raise HTTPException(403, "该令牌不是远程登录用途，请用管理页「生成登录链接」重新生成")
+    return HTMLResponse(_remote_login_html(),
+                        headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
+
+
+def _remote_login_html() -> str:
+    p = os.path.join(BASE_DIR, "remote_login.html")
+    try:
+        with open(p, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ("<!doctype html><meta charset=utf-8><body style='background:#0b0f19;"
+                "color:#e6e8ee;font-family:system-ui;padding:40px'>"
+                "<h2>远程登录</h2><p>控制页文件 remote_login.html 缺失。</p></body>")
+
+
+@app.websocket("/ws/remote-login")
+async def remote_login_ws(ws: WebSocket, token: str = ""):
+    """串流通道：驱动 RemoteLoginSession（画面推帧 + 键鼠转发 + 登录检测）。
+
+    令牌在握手时二次校验 active；会话本体（RemoteLoginSession）在首个 WS
+    连接到达时创建并启动（URL 生成 ≠ 会话开始，用户真正打开才算）。
+    并发模型：CDP 泵线程产帧 → _frames 队列；reader task 收前端输入 →
+    _inputs 队列；本协程 select 两队列 + 定期登录检测。凭据不出服务器。
+    """
+    import asyncio as _aio
+    if not token or not _import_token_active(token) or _import_token_mode(token) != "url":
+        await ws.close(code=4401)
+        return
+    await ws.accept()
+    from login_session import RemoteLoginSession, new_login_aid
+    from tetherpool import TP
+
+    with _REMOTE_LOGIN_LOCK:
+        old = _REMOTE_LOGINS.pop(_import_token_hash(token), None)
+    if old is not None:
+        try:
+            old.cleanup(engine)
+        except Exception:                              # noqa: BLE001
+            pass
+
+    aid = new_login_aid()
+    # label 取令牌生成时的 label_hint（管理页填的账号标签），无则落 ID
+    _tok_ent = _IMPORT_TOKENS.get(_import_token_hash(token)) or {}
+    sess = RemoteLoginSession(aid, label=str(_tok_ent.get("label_hint") or ""))
+    _frames: _aio.Queue = _aio.Queue(maxsize=8)        # 背压：丢旧帧保实时
+    _inputs: _aio.Queue = _aio.Queue()
+    _loop = _aio.get_running_loop()
+
+    def _frame_sink(data, metadata):
+        if not data:
+            return
+        item = {"t": "frame", "img": data, "meta": metadata}
+
+        def _put():
+            try:
+                _frames.put_nowait(item)
+            except _aio.QueueFull:
+                try:
+                    _frames.get_nowait()               # 丢最旧帧
+                except _aio.QueueEmpty:
+                    pass
+            try:
+                _frames.put_nowait(item)
+            except _aio.QueueFull:
+                pass
+        try:
+            # patch27（自查根修）：CDP 泵线程 → 事件循环线程必须走
+            # call_soon_threadsafe——asyncio.Queue 非线程安全，直 put 竞态
+            # 可炸循环；循环已关（会话收尾后泵残余帧）静默丢弃。
+            _loop.call_soon_threadsafe(_put)
+        except RuntimeError:
+            pass
+    sess._frame_sink = _frame_sink
+
+    proxy = TP.acquire(aid, constraints={"tier": "premium", "tier_policy": "premium_only"})
+    if proxy:
+        sess.proxy = proxy
+    else:
+        log.warning("【远程登录】账号 %s premium 出口获取失败，回退无代理 context", aid)
+    try:
+        sess.start(engine)
+    except Exception as exc:                           # noqa: BLE001
+        sess.cleanup(engine)
+        await ws.send_json({"t": "error", "msg": str(exc)[:120]})
+        await ws.close()
+        return
+    with _REMOTE_LOGIN_LOCK:
+        _REMOTE_LOGINS[_import_token_hash(token)] = sess
+
+    async def _reader():
+        """收前端键鼠/视口消息 → dispatch_input（泵线程安全：CDP send 自带锁）。"""
+        try:
+            while True:
+                msg = await ws.receive_json()
+                if isinstance(msg, dict) and msg.get("t") in (
+                        "mouse", "key", "insert", "wheel", "viewport"):
+                    await _inputs.put(msg)
+        except WebSocketDisconnect:
+            pass
+
+    reader = _aio.create_task(_reader())
+    outcome: dict = {}
+    try:
+        while True:
+            # 双队列等待：帧/输入谁先到处理谁；1s 空转做状态推送与登录检测
+            get_frame = _aio.create_task(_frames.get())
+            get_input = _aio.create_task(_inputs.get())
+            done, _ = await _aio.wait(
+                {get_frame, get_input}, timeout=1.0,
+                return_when=_aio.FIRST_COMPLETED)
+            for task in done:
+                item = task.result()
+                if item.get("t") == "frame":
+                    await ws.send_json(item)
+                else:
+                    sess.dispatch_input(item)
+            for task in (get_frame, get_input):
+                if not task.done():
+                    task.cancel()
+            if sess.logged_in:
+                break
+            if sess.expired():
+                outcome["t"] = "timeout"
+                await ws.send_json(outcome)
+                break
+            if sess.error and not sess.page:
+                outcome = {"t": "error", "msg": sess.error}
+                await ws.send_json(outcome)
+                break
+            if not sess.logged_in:
+                # 登录检测（线程池跑，带独立限频；探测走 premium 出口）
+                ok = await _aio.get_running_loop().run_in_executor(
+                    None, lambda: sess.check_login(engine))
+                if ok:
+                    break
+            await ws.send_json({"t": "status", **sess.snapshot()})
+
+        if sess.logged_in:
+            # 凭据不出服务器：cookie 抓取与落库都在本端完成（铁律）。
+            cookies = sess.cookie_details()
+            exp = {k: v["expires"] for k, v in cookies.items()
+                   if v.get("expires", -1) > 0}
+            proxy_out = {k: v for k, v in (sess.proxy or {}).items()
+                         if not k.startswith("_")}
+            binding = (sess.proxy or {}).get("_binding")
+            acc = store.add_account({k: v["value"] for k, v in cookies.items()},
+                                    sess.label, cookies_exp=exp or None, aid=sess.aid)
+            if proxy_out:
+                store.update_account(acc["id"], proxy=proxy_out, binding=binding)
+            outcome = {"t": "done", "id": acc["id"], "label": acc["label"],
+                       "cookie_count": len(cookies), "bound": bool(proxy_out)}
+            log.info("【远程登录】新号入库（id=%s，label=%s，cookie %d 个，出口绑定=%s）",
+                     acc["id"], acc["label"], len(cookies), bool(proxy_out))
+            try:
+                await ws.send_json(outcome)
+            except Exception:                          # noqa: BLE001 — 前端可能已关页
+                pass
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:                           # noqa: BLE001
+        log.warning("【远程登录】WS 异常: %s", str(exc)[:120])
+    finally:
+        reader.cancel()
+        with _REMOTE_LOGIN_LOCK:
+            _REMOTE_LOGINS.pop(_import_token_hash(token), None)
+        if sess.logged_in:
+            sess.finish(engine)    # 保留 TP 绑定（已随账号入库，同 aid 同源 IP）
+        else:
+            sess.cleanup(engine)   # 未登录：释放出口，不留悬空绑定
+        _import_token_consume(token)   # 用完即焚（无论成功/超时/断开）
 
 
 def _proxy_test_identity(proxy: dict, cookies: dict | None) -> str:

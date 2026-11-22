@@ -520,6 +520,15 @@
         <label data-i18n="token-cmd-label">① 复制命令到本地运行（令牌已嵌入）</label>
         <pre class="code" id="tokCmdBox" style="display:none"><span class="cp" onclick="copyText(document.getElementById('tokCmdText').textContent)">复制</span><span id="tokCmdText"></span></pre>
       </div>
+      <div class="row" style="margin-top:14px;align-items:flex-end">
+        <div style="flex:2">
+          <label data-i18n="rl-url-label">③ 或远程浏览器导号：生成链接，对方打开直接在服务器浏览器里登录</label>
+          <div class="copyline">
+            <button class="btnlike" onclick="genLoginUrl()" id="genLoginUrlBtn">🖥 生成远程登录链接</button>
+          </div>
+        </div>
+      </div>
+      <pre class="code" id="rlUrlBox" style="display:none"><span class="cp" onclick="copyText(document.getElementById('rlUrlText').textContent)">复制</span><span id="rlUrlText"></span></pre>
       <div class="row" style="margin-top:10px">
         <div style="flex:2">
           <label data-i18n="dl-script-label">② 或下载脚本手动运行</label>
@@ -1636,6 +1645,23 @@ async function genImportToken(){
     $('tokCmdText').textContent = cmd;
     $('tokCmdBox').style.display = 'block';
     toast(`令牌已生成，${Math.round((d.expires_in||900)/60)} 分钟内有效、单次成功即失效`, 'ok');
+  }catch(e){
+    toast('生成失败：' + (e.message || e), 'warn');
+  }finally{
+    btn.disabled = false; btn.textContent = old;
+  }
+}
+
+/* patch27：一键远程登录导号——生成登录链接（URL 即访问凭证，15min 单活跃） */
+async function genLoginUrl(){
+  const btn = $('genLoginUrlBtn');
+  const label = ($('mImpLabel') && $('mImpLabel').value || '').trim();
+  btn.disabled = true; const old = btn.textContent; btn.textContent = '生成中…';
+  try{
+    const d = await api('/admin/import-login-url', {method:'POST', body: JSON.stringify({label})});
+    $('rlUrlText').textContent = d.url || '';
+    $('rlUrlBox').style.display = 'block';
+    toast(`登录链接已生成，${Math.round((d.expires_in||900)/60)} 分钟内有效；发给对方打开即可，谁拿到链接谁可操作`, 'ok');
   }catch(e){
     toast('生成失败：' + (e.message || e), 'warn');
   }finally{

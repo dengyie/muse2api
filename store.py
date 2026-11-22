@@ -256,7 +256,11 @@ class Store:
 
     # ---------- 账号 ----------
     def add_account(self, cookies: dict, label: str = "",
-                    cookies_exp: dict | None = None) -> dict:
+                    cookies_exp: dict | None = None,
+                    aid: str | None = None) -> dict:
+        """aid：patch27 远程导号预分配的账号 ID（出口已按它绑定）。
+        传入时用之，保证 TP 绑定/心跳与账号档案同键；冲突由调用方自查。
+        缺省行为不变（uuid4 hex 12 位）。"""
         with _LOCK:
             # patch23：同一 muse.ai 会话（hatch_sess 是唯一核心凭证）拒绝重复
             # 导入——防同号双档案双计费。锁内比较，竞态安全。
@@ -265,7 +269,7 @@ class Store:
                 for existing in self.accounts:
                     if (existing.get("cookies") or {}).get("hatch_sess") == sess:
                         raise ValueError(f"duplicate_session:{existing.get('id')}:{existing.get('label')}")
-            aid = uuid.uuid4().hex[:12]
+            aid = (aid or uuid.uuid4().hex[:12]).strip() or uuid.uuid4().hex[:12]
             exp = {k: int(v) for k, v in (cookies_exp or {}).items()
                    if _is_pos(v)}
             now = int(time.time())

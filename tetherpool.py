@@ -93,8 +93,10 @@ class TetherPoolClient:
 
         only_if_missing=True：进程内已有缓存绑定即直接返回（心跳自愈语义，
         避免每 300s 无谓 churn 出口——已绑定的账号保持原节点粘性）。
-        constraints：账号级出口约束（region/region_strict/egress_preference），
+        constraints：账号级出口约束（region/region_strict/egress_preference，
         透传控制面 acquire——ip-pool 侧会把约束落库 bound_* 列，重绑也守约束。
+        patch27：constraints 支持 tier / tier_policy 覆盖 config 默认——
+        导号等敏感动作用优质出口（premium_only），不传则行为完全不变。
         返回的 proxy dict 附带 _binding 档案（node/exit_ip/bound_at）。
         """
         if not enabled():
@@ -121,6 +123,7 @@ class TetherPoolClient:
                 params = {"service": "muse2api", "account_id": aid,
                           "tier": c["tier"], "tier_policy": c["policy"]}
                 if constraints:
+                    # patch27：tier/tier_policy 从 constraints 覆盖 config 默认。
                     params.update({k: v for k, v in constraints.items() if v})
                 if force or attempt > 0:
                     params["force_rebalance"] = "true"
