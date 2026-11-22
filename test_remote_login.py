@@ -293,6 +293,19 @@ sess4.error = None
 sess4.dispatch_input({"t": "goto", "url": "not a url \x01"})
 check("7.23 乱串不炸会话", True)
 
+# patch27f（review P2）：域边界绕过向量——endswith 无边界会误放行
+for bad in ("https://evilmuse.ai/x", "https://xmuse.ai/x", "https://MUSE.AI.EVIL.com/x"):
+    sess4.error = None
+    navp.calls.clear()
+    sess4.dispatch_input({"t": "goto", "url": bad})
+    check("7.24 域边界绕过拒绝 %s" % bad,
+          sess4.error and not any(m == "Page.navigate" for m, _ in navp.calls))
+# 大写正规域应放行（hostname 归一化小写）
+sess4.error = None
+navp.calls.clear()
+sess4.dispatch_input({"t": "goto", "url": "https://MUSE.AI/x"})
+check("7.25 大小写归一化放行", any(m == "Page.navigate" for m, _ in navp.calls))
+
 # finish 幂等 + cleanup 释放出口（无 TP 启用时静默）
 class _FakeEngine:
     browser = None

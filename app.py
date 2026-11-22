@@ -2874,8 +2874,12 @@ async def remote_login_ws(ws: WebSocket, token: str = ""):
     with _REMOTE_LOGIN_LOCK:
         old = _REMOTE_LOGINS.pop(_import_token_hash(token), None)
     if old is not None:
+        # patch27f（review P1）：cleanup 含 TP.release（同步 HTTP ≤10s）+
+        # disposeBrowserContext（同步 CDP）——async 协程里直调会卡死整个
+        # 事件循环（healthz/生成回调/其他会话推帧全冻结）。所有同步阻塞
+        # 调用一律 run_in_executor，与本 handler 内 engine.start 同口径。
         try:
-            old.cleanup(engine)
+            await _aio.get_running_loop().run_in_executor(None, old.cleanup, engine)
         except Exception:                              # noqa: BLE001
             pass
 
@@ -2903,6 +2907,9 @@ async def remote_login_ws(ws: WebSocket, token: str = ""):
         item = {"t": "frame", "img": data, "meta": metadata}
 
         def _put():
+            # patch27f（review P2）：原实现两个 put_nowait 平级——队列未满时
+            # 同一帧入队两次（带宽翻倍、有效帧率腰斩，3Mbps 上行瓶颈下尤甚）。
+            # 改为互斥：满则丢最旧帧再放新帧，每次调用恰好入队一帧。
             try:
                 _frames.put_nowait(item)
             except _aio.QueueFull:
@@ -2910,10 +2917,10 @@ async def remote_login_ws(ws: WebSocket, token: str = ""):
                     _frames.get_nowait()               # 丢最旧帧
                 except _aio.QueueEmpty:
                     pass
-            try:
-                _frames.put_nowait(item)
-            except _aio.QueueFull:
-                pass
+                try:
+                    _frames.put_nowait(item)
+                except _aio.QueueFull:
+                    pass
         try:
             # patch27（自查根修）：CDP 泵线程 → 事件循环线程必须走
             # call_soon_threadsafe——asyncio.Queue 非线程安全，直 put 竞态
@@ -2923,15 +2930,29 @@ async def remote_login_ws(ws: WebSocket, token: str = ""):
             pass
     sess._frame_sink = _frame_sink
 
-    proxy = TP.acquire(aid, constraints={"tier": "premium", "tier_policy": "premium_only"})
-    if proxy:
-        sess.proxy = proxy
-    else:
-        log.warning("【远程登录】账号 %s premium 出口获取失败，回退无代理 context", aid)
+    # patch27f（review P1+P2）：acquire 是控制面同步 HTTP（timeout=20s，满载
+    # 3 次重试最坏 ~60s）——必须走 executor，否则建会话瞬间全服务冻结。
+    # 语义同步根修：premium 获取失败**拒绝跨池**（用户裁定原话语义），不再
+    # 回退无代理 context——无代理登录大概率失败（容器直连 muse.ai 实测
+    # 握手超时）且成功也会产出无出口账号，不如让用户直接重试。
     try:
-        sess.start(engine)
+        proxy = await _aio.get_running_loop().run_in_executor(
+            None, lambda: TP.acquire(aid, constraints={"tier": "premium",
+                                                       "tier_policy": "premium_only"}))
     except Exception as exc:                           # noqa: BLE001
-        sess.cleanup(engine)
+        proxy = None
+        log.warning("【远程登录】账号 %s premium acquire 异常: %s", aid, str(exc)[:80])
+    if not proxy:
+        await ws.send_json({"t": "error",
+                            "msg": "premium 出口获取失败（拒绝跨池），请稍后重试或联系管理员"})
+        await ws.close()
+        _import_token_consume(token)
+        return
+    sess.proxy = proxy
+    try:
+        await _aio.get_running_loop().run_in_executor(None, sess.start, engine)
+    except Exception as exc:                           # noqa: BLE001
+        await _aio.get_running_loop().run_in_executor(None, sess.cleanup, engine)
         await ws.send_json({"t": "error", "msg": str(exc)[:120]})
         await ws.close()
         return
@@ -3014,10 +3035,18 @@ async def remote_login_ws(ws: WebSocket, token: str = ""):
         reader.cancel()
         with _REMOTE_LOGIN_LOCK:
             _REMOTE_LOGINS.pop(_import_token_hash(token), None)
-        if sess.logged_in:
-            sess.finish(engine)    # 保留 TP 绑定（已随账号入库，同 aid 同源 IP）
-        else:
-            sess.cleanup(engine)   # 未登录：释放出口，不留悬空绑定
+        # patch27f（review P1）：finish/cleanup 含同步 HTTP + CDP 调用，executor 化
+        # （login_session 里 on_login_probe 默认 None，check_login 已在主循环走
+        # executor；此处只碰 finish/cleanup 的同步网络与 CDP 路径）
+        try:
+            if sess.logged_in:
+                await _aio.get_running_loop().run_in_executor(
+                    None, sess.finish, engine)   # 保留 TP 绑定（已随账号入库）
+            else:
+                await _aio.get_running_loop().run_in_executor(
+                    None, sess.cleanup, engine)  # 未登录：释放出口不留悬空绑定
+        except Exception:                          # noqa: BLE001 — 收尾失败不掩盖主流程
+            pass
         _import_token_consume(token)   # 用完即焚（无论成功/超时/断开）
 
 

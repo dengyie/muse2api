@@ -165,8 +165,13 @@ class RemoteLoginSession:
                     parts = urlsplit(url)
                 except ValueError:
                     parts = None
+                # patch27f（review P2）：原 endswith("muse.ai") 可被 evilmuse.ai
+                # /xmuse.ai 绕过（实测 PASS）——白名单须带域边界：精确等于或
+                # 以 ".muse.ai" 结尾（子域才放行），仿冒尾串一律拒绝。
+                host = (parts.hostname or "").lower() if parts else ""
+                allowed_host = host == "muse.ai" or host.endswith(".muse.ai")
                 if (not parts or parts.scheme not in ("http", "https")
-                        or not (parts.hostname or "").endswith("muse.ai")):
+                        or not allowed_host):
                     self.error = "登录链接被拒绝：仅支持 muse.ai 域"
                     return
                 self.page.send("Page.navigate", {"url": url})
