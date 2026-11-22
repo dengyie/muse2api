@@ -256,6 +256,43 @@ sess3.page = None
 sess3.dispatch_input({"t": "mouse", "x": 1, "y": 2})
 check("7.15 无 page 输入静默丢弃", sess3.error is None)
 
+# patch27e：goto 导航——muse.ai 域白名单
+class _NavPage:
+    def __init__(self):
+        self.calls = []
+    def send(self, method, params=None):
+        self.calls.append((method, params))
+        if method == "Storage.getCookies":
+            return {"result": {"cookies": []}}
+        return {}
+navp = _NavPage()
+sess4 = RemoteLoginSession("aabbccddeeff", "t")
+sess4.page = navp
+sess4.dispatch_input({"t": "goto", "url": "https://muse.ai/auth/magic?tok=abc"})
+check("7.18 muse.ai 链接放行导航",
+      ("Page.navigate", {"url": "https://muse.ai/auth/magic?tok=abc"}) in navp.calls)
+sess4.dispatch_input({"t": "goto", "url": "https://evil.example.com/phish"})
+check("7.19 非 muse.ai 域拒绝", sess4.error and not any(
+    m == "Page.navigate" for m, _ in navp.calls[1:]))
+sess4.error = None
+sess4.dispatch_input({"t": "goto", "url": "javascript:alert(1)"})
+check("7.20 javascript: 拒绝", sess4.error and not any(
+    m == "Page.navigate" and p.get("url") == "javascript:alert(1)"
+    for m, p in navp.calls))
+sess4.error = None
+sess4.dispatch_input({"t": "goto", "url": "https://sub.muse.ai/path"})
+check("7.21 muse.ai 子域放行", any(
+    m == "Page.navigate" and p.get("url") == "https://sub.muse.ai/path"
+    for m, p in navp.calls))
+sess4.error = None
+sess4.dispatch_input({"t": "goto", "url": "https://muse.ai.evil.com/x"})
+check("7.22 仿冒域(muse.ai.evil.com)拒绝", sess4.error and not any(
+    m == "Page.navigate" and p.get("url") == "https://muse.ai.evil.com/x"
+    for m, p in navp.calls))
+sess4.error = None
+sess4.dispatch_input({"t": "goto", "url": "not a url \x01"})
+check("7.23 乱串不炸会话", True)
+
 # finish 幂等 + cleanup 释放出口（无 TP 启用时静默）
 class _FakeEngine:
     browser = None

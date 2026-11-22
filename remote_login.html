@@ -26,6 +26,14 @@
   .dot.ok{ background:#3fb26f; } .dot.err{ background:#e05252; } .dot.warn{ background:#d9a53f; }
   .kbd{ border:1px solid #333c55; border-radius:4px; padding:1px 6px; font-size:11px; color:#aeb6c8; }
   #fps{ min-width:64px; display:inline-block; }
+  #urlbar{ display:flex; gap:8px; margin-top:8px; width:min(720px, 94vw); }
+  #urlbar input{ flex:1; background:#111827; border:1px solid #2a3448; border-radius:8px;
+                 color:#e6e8ee; padding:8px 12px; font-size:13px; }
+  #urlbar input:focus{ outline:none; border-color:#4a6fa5; }
+  #urlbar button{ background:#2d5da9; border:none; border-radius:8px; color:#fff;
+                  padding:8px 16px; font-size:13px; cursor:pointer; white-space:nowrap; }
+  #urlbar button:hover{ background:#3a6cb8; }
+  #urlbar button:disabled{ opacity:.5; cursor:default; }
 </style>
 </head>
 <body>
@@ -41,6 +49,14 @@
   <span><span class="dot" id="stDot"></span><span id="stText">连接中</span></span>
   <span id="fps">0 fps</span>
   <span>输入密码可用 <span class="kbd">Ctrl+V</span> 直接粘贴</span>
+</div>
+
+<!-- patch27e：发送登录链接——magic link 是 URL，须让服务器浏览器导航过去；
+     本页在 http:// 内网 IP 上属非安全上下文，navigator.clipboard 不可用，
+     Ctrl+V 读剪贴板会静默失败，故提供显式输入条（粘贴到框内点发送）。 -->
+<div id="urlbar">
+  <input id="urlInput" type="url" placeholder="粘贴 muse.ai 登录链接（邮件里的 magic link），点发送即跳转" autocomplete="off" spellcheck="false">
+  <button id="urlGo">发送 →</button>
 </div>
 
 <script>
@@ -96,14 +112,24 @@
           deltaX:e.deltaX, deltaY:e.deltaY}); e.preventDefault(); }, {passive:false});
   canvas.addEventListener('contextmenu', e => e.preventDefault());
 
+  // patch27e：发送登录链接输入条——先取引用再注册键盘监听（避免 TDZ 歧义）
+  const urlInput = $('urlInput'), urlGo = $('urlGo');
+
   // 键盘：文本键走 dispatchKeyEvent(text)，Ctrl+V 整段粘贴走 insert（密码框友好）
+  // patch27e：非安全上下文（http 内网 IP）navigator.clipboard 不存在——
+  // 失败时提示改用下方输入条，不再静默吞掉。
   window.addEventListener('keydown', e => {
     if (e.key === 'F5'){ return; }                 // 放行刷新本页
+    if (e.target === urlInput) return;             // 输入框内正常打字，不拦截
     e.preventDefault();
     if ((e.ctrlKey || e.metaKey) && (e.key === 'v' || e.key === 'V')){
-      navigator.clipboard.readText().then(txt => {
-        if (txt) send({t:'insert', text:txt});
-      }).catch(()=>{});
+      if (navigator.clipboard && navigator.clipboard.readText){
+        navigator.clipboard.readText().then(txt => {
+          if (txt) send({t:'insert', text:txt});
+        }).catch(()=> setStatus('warn','此页面读不了剪贴板：请粘贴到下方输入条'));
+      } else {
+        setStatus('warn','此页面读不了剪贴板：请粘贴到下方输入条');
+      }
       return;
     }
     send({t:'key', type:'keyDown', key:e.key, code:e.code,
@@ -111,7 +137,8 @@
           text: e.key.length === 1 && !e.ctrlKey && !e.metaKey ? e.key : undefined});
   });
   window.addEventListener('keyup', e => {
-    if (e.key === 'F5'){ return; }
+    if (e.key === 'F5'){ return; }                 // 放行刷新本页
+    if (e.target === urlInput) return;             // 输入框内打字不转发（patch27e）
     e.preventDefault();
     send({t:'key', type:'keyUp', key:e.key, code:e.code});
   });
@@ -124,6 +151,23 @@
   }
 
   function send(obj){ if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+
+  // ---------- 发送登录链接（patch27e） ----------
+  // magic link 是 URL：走 goto 让服务器浏览器直接导航（服务端限 muse.ai 域）
+  function sendUrl(){
+    const u = urlInput.value.trim();
+    if (!u) return;
+    if (!/^https?:\/\//i.test(u)){ setStatus('warn','链接须以 http(s):// 开头'); return; }
+    send({t:'goto', url:u});
+    urlInput.value = '';
+    urlGo.textContent = '已发送 ✓';
+    setTimeout(()=>{ urlGo.textContent = '发送 →'; }, 1500);
+  }
+  urlGo.addEventListener('click', sendUrl);
+  urlInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter'){ sendUrl(); }
+    e.stopPropagation();     // 不让按键漏进全局转发（否则打字会打到画面里）
+  });
 
   // ---------- WS 连接 ----------
   function connect(){

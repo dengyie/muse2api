@@ -122,6 +122,9 @@ class RemoteLoginSession:
         {"t":"key","type":"keyDown",...,"text":"a"}
         {"t":"insert","text":"..."} （整段粘贴——密码框友好）
         {"t":"viewport","w":..,"h":..} （resize 模拟）
+        {"t":"goto","url":"..."} （控制页「发送登录链接」——magic link 是 URL，
+        Input.insertText 只能塞输入框不能导航；限 muse.ai 域，防令牌持有者
+        把服务器浏览器当通用跳板）
         """
         if not self.page:
             return
@@ -151,6 +154,22 @@ class RemoteLoginSession:
                 self.page.send("Input.dispatchKeyEvent", params)
             elif t == "insert":
                 self.page.send("Input.insertText", {"text": msg.get("text") or ""})
+            elif t == "goto":
+                url = (msg.get("url") or "").strip()
+                # patch27e：只放行 muse.ai（含子域）http(s)——magic link 形如
+                # https://muse.ai/auth/... ；其余一律拒绝（登录页可能弹出
+                # facebook/google OAuth，但 premium 出口到不了那些域，见
+                # 2026-11-23 实弹；邮箱 magic link 全程不出 muse.ai 域）。
+                from urllib.parse import urlsplit
+                try:
+                    parts = urlsplit(url)
+                except ValueError:
+                    parts = None
+                if (not parts or parts.scheme not in ("http", "https")
+                        or not (parts.hostname or "").endswith("muse.ai")):
+                    self.error = "登录链接被拒绝：仅支持 muse.ai 域"
+                    return
+                self.page.send("Page.navigate", {"url": url})
             elif t == "viewport":
                 self.page.send("Emulation.setDeviceMetricsOverride", {
                     "width": int(msg.get("w") or 1280),

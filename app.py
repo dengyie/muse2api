@@ -2937,7 +2937,7 @@ async def remote_login_ws(ws: WebSocket, token: str = ""):
             while True:
                 msg = await ws.receive_json()
                 if isinstance(msg, dict) and msg.get("t") in (
-                        "mouse", "key", "insert", "wheel", "viewport"):
+                        "mouse", "key", "insert", "wheel", "viewport", "goto"):
                     await _inputs.put(msg)
         except WebSocketDisconnect:
             pass
