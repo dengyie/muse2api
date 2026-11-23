@@ -1434,6 +1434,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
     cur_acc = lease(account_id=account_id, preferred_id=None, rotate=True)
     last_exc = None
     rebound = False  # 本轮是否完成过 TetherPool 重绑（单号池原地重试依据）
+    rebound_failed = False  # patch32：重绑曾因控制面不可达失败（原地重试的放宽依据）
     base_prompt = prompt  # refusal 重写始终基于原始需求（不叠加多份指令文本）
     # patch30e：风控熔断计数是「任务级」非「轮级」——一次任务（含 3 轮
     # refusal 改写重试）只计 1 次（用户裁定：3 个独立任务失败才冻结，
@@ -1488,8 +1489,15 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                     if not alt or (old_id and alt["id"] == old_id):
                         # 池内无其他账号（如单号池）：若本轮刚完成 TetherPool 重绑，
                         # 新出口已生效，原地重试一次而不是直接放弃（P2 根修）。
-                        if isinstance(last_exc, MuseProxyError) and rebound and attempt + 1 < 3:
-                            log.info("【TetherPool】重绑已完成，单号池原地重试 %s (%s)", cur_acc.get("label"), cur_acc["id"])
+                        # patch32：重绑虽未成功但属控制面瞬时不可达（rebound_failed）
+                        # ——下一轮 _bind_account_proxy/心跳可能已拿到新出口，同样
+                        # 给一次原地重试机会；deadline 由循环顶部统一兜底。
+                        if (isinstance(last_exc, MuseProxyError)
+                                and (rebound or rebound_failed)
+                                and attempt + 1 < 3):
+                            log.info("【TetherPool】重绑%s，单号池原地重试 %s (%s)",
+                                     "已完成" if rebound else "暂未成功（控制面恢复中），",
+                                     cur_acc.get("label"), cur_acc["id"])
                             continue
                         break
                     log.info("【生图/视频自动切号】切换到备用账号 %s (%s) 重试...", cur_acc.get("label"), cur_acc["id"])
@@ -1554,6 +1562,34 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                         engine._last_http_renew.pop(cur_acc["id"], None)
                         rebound = True
                         log.info("【TetherPool】账号 %s 代理异常已重绑", cur_acc["id"])
+                    else:
+                        # patch32（2026-11-24 实证 task_89b34124）：acquire 失败
+                        # ≠ 出口坏了——多为控制面瞬时不可达（Max retries 数秒级，
+                        # 心跳 300s 后自愈）。原实现直接放行，attempt>0 后单号池
+                        # 且 rebound=False → 任务秒死，控制面恢复也救不回。退避
+                        # 15s 重试一次 acquire（deadline 有余量才等）；仍未成功
+                        # 置 rebound_failed，让切号分支允许原地再试（心跳/下轮
+                        # acquire 可能已补上）。
+                        rebound_failed = True
+                        if time.monotonic() < deadline - 30:
+                            log.warning("【TetherPool】账号 %s 重绑失败（控制面瞬时不可达？），15s 后重试一次", cur_acc["id"])
+                            time.sleep(15)
+                            try:
+                                new_proxy = TP.acquire(
+                                    cur_acc["id"], force=True,
+                                    constraints=_egress_constraints(cur_acc))
+                            except Exception as exc2:  # noqa: BLE001 — 控制面仍不可达
+                                log.warning("【TetherPool】账号 %s 重绑重试仍失败: %s",
+                                            cur_acc["id"], str(exc2)[:120])
+                                new_proxy = None
+                            if new_proxy:
+                                cur_acc = store.update_account(
+                                    cur_acc["id"], proxy=new_proxy,
+                                    binding=new_proxy.get("_binding"))
+                                engine._last_http_renew.pop(cur_acc["id"], None)
+                                rebound = True
+                                rebound_failed = False
+                                log.info("【TetherPool】账号 %s 重绑重试成功", cur_acc["id"])
             except MuseModelRefusalError as exc:
                 # 二开：refusal 单独捕获——清页面后 continue 重发（上方分支已改写 prompt）
                 last_exc = exc
