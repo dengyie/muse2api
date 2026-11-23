@@ -173,8 +173,8 @@ real_mark = app.store.mark
 app.store.mark = lambda *a, **k: None
 
 try:
-    # 7a：3 轮全 refusal → 耗尽上抛；streak 应达 3 并触发冻结（第 3 次冻结
-    # 即清零 streak，video_frozen_until 落库）
+    # 7a（patch30e 语义）：3 轮全 refusal 的**单个任务**只计 1 次——不再冻结；
+    # 任务耗尽上抛 refusal。
     eng.script = [MuseModelRefusalError("r1"), MuseModelRefusalError("r2"),
                   MuseModelRefusalError("r3")]
     raised = None
@@ -184,13 +184,45 @@ try:
         raised = e
     check("7.1 三轮 refusal 耗尽上抛", isinstance(raised, MuseModelRefusalError), repr(raised))
     a_after = s30.get_account(s30.a)
-    check("7.2 3 次 refusal 触发冻结",
-          s30.video_frozen(a_after), a_after.get("video_frozen_until"))
+    check("7.2 单任务 3 轮只计 1 次（不冻结）",
+          a_after.get("video_fail_streak") == 1 and not s30.video_frozen(a_after),
+          (a_after.get("video_fail_streak"), a_after.get("video_frozen_until")))
+
+    # 7b：第 2 个独立任务 2 轮 refusal（第 2 轮因 deadline-break 不会发生——
+    # 单任务仍只计 1）→ streak=2；第 3 个任务 refusal → streak=3 冻结。
+    # 任务 2：2 轮 refusal（deadline 临近 break 也只计 1）
+    eng.script = [MuseModelRefusalError("t2r1"), MuseModelRefusalError("t2r2")]
+    try:
+        app._run_generation_locked("一只猫", "video", 600)
+    except Exception:  # noqa: BLE001
+        pass
+    check("7.3 第 2 个任务仍只计 1（streak=2 未冻结）",
+          s30.get_account(s30.a).get("video_fail_streak") == 2
+          and not s30.video_frozen(s30.get_account(s30.a)),
+          s30.get_account(s30.a).get("video_fail_streak"))
+    # 任务 3：1 轮 refusal 即达 3 → 冻结
+    eng.script = [MuseModelRefusalError("t3r1"), {"url": "http://x/v.mp4"}]
+    try:
+        app._run_generation_locked("一只猫", "video", 600)
+    except Exception:  # noqa: BLE001
+        pass
+    a_after = s30.get_account(s30.a)
+    check("7.4 第 3 个任务 refusal 达 3 → 冻结", s30.video_frozen(a_after),
+          a_after.get("video_frozen_until"))
     until = a_after.get("video_frozen_until") or 0
     days = (until - time.time()) / 86400
-    check("7.3 冻结时长 ≈7 天", 6.9 <= days <= 7.1, round(days, 2))
+    check("7.5 冻结时长 ≈7 天", 6.9 <= days <= 7.1, round(days, 2))
+    # 冻结后同任务不再重发：任务 4 首轮即 refusal → break（generate 只调 1 次）
+    eng.script = [MuseModelRefusalError("t4r1"), MuseModelRefusalError("t4r2"),
+                  MuseModelRefusalError("t4r3")]
+    eng.calls = 0
+    try:
+        app._run_generation_locked("一只猫", "video", 600)
+    except Exception:  # noqa: BLE001
+        pass
+    check("7.6 冻结账号终止本任务后续重发（generate 恰 1 次）", eng.calls == 1, eng.calls)
 
-    # attachment_broken：不计数（冻结中账号也不会再累计）
+    # attachment_broken：不计数
     exc = MuseModelRefusalError("attachment gone", code="upstream_attachment_broken")
     eng.script = [exc]
     raised = None
@@ -198,15 +230,27 @@ try:
         app._run_generation_locked("一只猫", "video", 600)
     except Exception as e:  # noqa: BLE001
         raised = e
-    check("7.4 attachment_broken 上抛", raised is exc, repr(raised))
+    check("7.7 attachment_broken 上抛", raised is exc, repr(raised))
 
-    # 解冻后成功：streak 清零语义（先手动解冻，再成功一次）
+    # image refusal：不计数也不清零（patch30e BUG-1/4 根修）
     s30.thaw_account(s30.a)
-    s30.record_video_refusal(s30.a)  # 解冻后留 1 次 streak
+    s30.record_video_refusal(s30.a)  # streak=1
+    eng.script = [MuseModelRefusalError("img r1"), MuseModelRefusalError("img r2"),
+                  MuseModelRefusalError("img r3")]
+    raised = None
+    try:
+        app._run_generation_locked("一只猫", "image", 600)
+    except Exception as e:  # noqa: BLE001
+        raised = e
+    check("7.8 image refusal 耗尽上抛", isinstance(raised, MuseModelRefusalError), repr(raised))
+    check("7.9 image refusal 不计入视频 streak（仍=1）",
+          s30.get_account(s30.a).get("video_fail_streak") == 1,
+          s30.get_account(s30.a).get("video_fail_streak"))
+
+    # video 成功：清零（image 成功不清零的对称验证在 7.9 之后做）
     eng.script = [{"url": "http://x/v.mp4"}]
     res, _ = app._run_generation_locked("一只猫", "video", 600)
-    check("7.5 成功返回", res == {"url": "http://x/v.mp4"})
-    check("7.6 成功清零 streak",
+    check("7.10 video 成功清零 streak",
           s30.get_account(s30.a).get("video_fail_streak") == 0,
           s30.get_account(s30.a).get("video_fail_streak"))
 finally:

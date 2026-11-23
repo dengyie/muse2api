@@ -201,6 +201,12 @@ class AccountPoolManager:
                     acc = self.store.get_account(account_id)
                     if not acc or not acc.get("enabled", True):
                         raise MuseAuthError(f"指定账号 {account_id} 不存在或已禁用")
+                    # patch30e：显式指定账号也守视频熔断（BUG-5 防御补齐——
+                    # 现网调用方虽未传 account_id，但该分支不能成为绕冻结的后门）。
+                    if self.store.video_frozen(acc):
+                        raise MuseGenerationError(
+                            f"账号 {account_id} 视频链路熔断冻结中（refusal×3），"
+                            "到期自动解冻或经 /admin/accounts/{id}/video-thaw 豁免")
                     if account_id not in self.busy_accounts:
                         self.busy_accounts.add(account_id)
                         return acc
@@ -1429,6 +1435,11 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
     last_exc = None
     rebound = False  # 本轮是否完成过 TetherPool 重绑（单号池原地重试依据）
     base_prompt = prompt  # refusal 重写始终基于原始需求（不叠加多份指令文本）
+    # patch30e：风控熔断计数是「任务级」非「轮级」——一次任务（含 3 轮
+    # refusal 改写重试）只计 1 次（用户裁定：3 个独立任务失败才冻结，
+    # 避免单任务卡住几分钟内瞬间冻号）。仅 video 计入；image refusal
+    # 与视频熔断无关（BUG-1 根修）。
+    task_refusal_counted = False
     try:
         # patch22r：on_started（账号租约获取后一次，任务置 processing/started）
         # 与 on_acquired（每次上游发起前，attempt 入账）拆分——merge1611 合入
@@ -1512,7 +1523,8 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                                       account_id=cur_acc["id"], on_progress=on_progress,
                                       reference_image=reference_image, **engine_kwargs)
                 store.mark(cur_acc["id"], True, "")
-                store.record_video_success(cur_acc["id"])  # patch30：成功清零 refusal 连败
+                if kind == "video":  # patch30e：仅 video 成功清零 refusal 连败（BUG-4）
+                    store.record_video_success(cur_acc["id"])
                 _sync_cookies(cur_acc["id"])
                 return res, cur_acc["id"]
             except MuseAuthError as exc:
@@ -1550,15 +1562,25 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 # patch30：视频风控熔断——只把「真 refusal」（模型只回文本）计入
                 # 连败；upstream_attachment_broken 是附件链路失效（改 prompt 修不了
                 # 的快速失败通道），不是账号风控信号，不计入。
-                if (exc.code or "generation_failed") == "generation_failed":
-                    snap = store.record_video_refusal(
-                        cur_acc["id"],
-                        note=f"视频 refusal 连败计数: {str(exc)[:50]}")
-                    if snap and snap.get("video_frozen_until"):
-                        log.warning("【风控熔断】账号 %s refusal 达 3 次，视频链路冻结 7 天（至 %s）",
-                                    cur_acc["id"],
-                                    time.strftime("%Y-%m-%d %H:%M",
-                                                  time.localtime(snap["video_frozen_until"])))
+                # patch30e：①仅 kind=="video" 计入（image refusal 与视频熔断
+                # 无关，BUG-1 根修）；②任务级去重——一次任务只计 1 次（用户
+                # 裁定 3 个独立任务失败才冻结）；③冻结即刻生效——本任务不再
+                # 用已冻账号重发（BUG-3 根修），break 走终态上抛。
+                if (kind == "video"
+                        and (exc.code or "generation_failed") == "generation_failed"):
+                    if not task_refusal_counted:
+                        task_refusal_counted = True
+                        snap = store.record_video_refusal(
+                            cur_acc["id"],
+                            note=f"视频 refusal 连败计数: {str(exc)[:50]}")
+                        if snap and snap.get("video_frozen_until"):
+                            log.warning("【风控熔断】账号 %s refusal 达 3 次，视频链路冻结 7 天（至 %s）",
+                                        cur_acc["id"],
+                                        time.strftime("%Y-%m-%d %H:%M",
+                                                      time.localtime(snap["video_frozen_until"])))
+                    if store.video_frozen(store.get_account(cur_acc["id"]) or {}):
+                        log.warning("【风控熔断】账号 %s 已冻结，终止本任务后续重发", cur_acc["id"])
+                        break
             except MuseGenerationError as exc:
                 last_exc = exc
                 store.mark(cur_acc["id"], True, f"任务异常: {str(exc)[:60]}")
