@@ -253,6 +253,18 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def _bind_account_proxy(account: dict):
     """Pin the selected account's route for the whole operation, including retries."""
+    # patch29 层3：托管账号绑定档案落 CN 一律拒绝出海——挡历史残留绑定
+    # （池侧/层1/层2 都拦不住的存量数据）。生成链路抛 MuseProxyError 触发
+    # 既有「强制重绑→原地重试」自愈；其它链路显式报错 fail-closed。
+    # 直连风险背景：宿主 tencent-lh 本身就是 CN 出口（上海腾讯云），CN 绑定
+    # 或清空 proxy 直连都是封号级事故，宁可不跑。
+    _bp = account.get("proxy") if isinstance(account.get("proxy"), dict) else None
+    if (_bp and tetherpool.enabled() and tetherpool.is_managed(_bp)
+            and tetherpool.is_cn_region((account.get("binding") or {}).get("region"))):
+        aid = account.get("id") or "?"
+        node = (account.get("binding") or {}).get("node_id") or "?"
+        log.error("【TetherPool】账号 %s 绑定出口 %s 是 CN region，拒绝出海，强制重绑", aid, node)
+        raise MuseProxyError(f"账号 {aid} 出口 {node} 为 CN region（封号风险），已拒绝并触发重绑")
     if hasattr(engine, "_ensure_local"):
         engine._ensure_local().proxy_snapshot = copy.deepcopy(account.get("proxy")) or None
 

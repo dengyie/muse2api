@@ -7,6 +7,7 @@
 #   P1 build sha + 存活状态       镜像在位 + healthz 状态健康（防漂移真校验）
 #   P2 账号池                     有可用账号、会话 ok、额度未全枯竭
 #   P3 TetherPool                 控制面可达、绑定存在、出口 ≤5 号铁律
+#   P9 CN 出口封禁                muse2api 绑定落 CN region 即 FAIL（patch29 防漂移）
 #   P4 mediabak                   备份通道健康（退避/冷却计入 FAIL；--no-cost 不豁免）
 #   P5 attach-probe               composer 附件链路可挂载（不发送不计费）
 #   P6 chat 快验                  muse-spark 真实上游往返（消耗额度，--no-cost 跳过）
@@ -83,6 +84,22 @@ over={k:v for k,v in c.items() if v>5}
 print('  bindings:', dict(c))
 exit(1 if over else 0)" 2>/dev/null && ok "同出口 ≤5 号铁律满足" || bad "同出口超限"
 [ "${N_BIND:-0}" -ge 1 ] && ok "绑定存在（$N_BIND 个账号）" || bad "无绑定"
+
+# patch29 P9：CN 出口封禁——任何 muse2api 绑定落 CN region 一律 FAIL
+# （背景：muse.ai 对国内出口风控极严会封号；宿主 tencent-lh 本身是 CN 出口，
+# patch29 三层防御见 tetherpool.py 头注。此处守「存量绑定不漂移到 CN」。）
+echo "$R" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+cn={k:(b.get('region') or '?', b.get('node_name') or '?')
+    for k,b in d.get('bindings',{}).items()
+    if str(b.get('region') or '').strip().lower().startswith('cn')}
+if cn:
+    for k,(r,n) in cn.items():
+        print('  [FAIL] CN 绑定: %s region=%s node=%s' % (k[:16], r, n))
+    sys.exit(1)
+print('  所有绑定均非 CN')
+sys.exit(0)" 2>/dev/null && ok "P9 CN 出口封禁：绑定全非 CN" || bad "P9 CN 出口封禁：发现 CN 绑定（立即 rebind 或查池侧 CN 节点）"
 
 hdr "P4 mediabak（备份硬退避计入 FAIL；mesh 冷却=已知降级 WARN，--no-cost 不豁免）"
 # patch22r：语义分级——「连续失败 N 次退避」= 备份通道真故障（FAIL）；

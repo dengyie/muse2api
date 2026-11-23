@@ -91,6 +91,9 @@ app.tetherpool = types.SimpleNamespace(
     enabled=lambda: True,
     is_managed=lambda p: bool(p and "tetherpool" in (p.get("username") or "")
                               or (p and "9101" in (p.get("server") or ""))),
+    # patch29：_bind_account_proxy 新增 CN 绑定校验——stub 需提供
+    is_cn_region=lambda region: bool(region)
+    and str(region).strip().lower().startswith("cn"),
 )
 
 # ---------------- 1. _rebind_on_proxy_error 语义 ----------------

@@ -178,6 +178,11 @@ class Config:
         default_factory=lambda: _env("MUSE2API_TETHERPOOL_TIER", "standard"))
     tetherpool_policy: str = field(
         default_factory=lambda: _env("MUSE2API_TETHERPOOL_POLICY", "standard_first"))
+    # patch29：CN 出口排除 CIDR 集（逗号分隔）——acquire 必带 avoid_cidr，
+    # 池侧硬过滤；配合 region=cn 拒绝层（tetherpool.is_cn_region）双保险。
+    tetherpool_avoid_cn_cidrs: str = field(
+        default_factory=lambda: _env("MUSE2API_TETHERPOOL_AVOID_CN_CIDRS",
+                                     "183.193.0.0/16"))
 
     @property
     def data_dir(self) -> str:
