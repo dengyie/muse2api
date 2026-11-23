@@ -1512,6 +1512,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                                       account_id=cur_acc["id"], on_progress=on_progress,
                                       reference_image=reference_image, **engine_kwargs)
                 store.mark(cur_acc["id"], True, "")
+                store.record_video_success(cur_acc["id"])  # patch30：成功清零 refusal 连败
                 _sync_cookies(cur_acc["id"])
                 return res, cur_acc["id"]
             except MuseAuthError as exc:
@@ -1546,6 +1547,18 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 last_exc = exc
                 store.mark(cur_acc["id"], True, f"模型只回文本: {str(exc)[:60]}")
                 engine.close_current_page()
+                # patch30：视频风控熔断——只把「真 refusal」（模型只回文本）计入
+                # 连败；upstream_attachment_broken 是附件链路失效（改 prompt 修不了
+                # 的快速失败通道），不是账号风控信号，不计入。
+                if (exc.code or "generation_failed") == "generation_failed":
+                    snap = store.record_video_refusal(
+                        cur_acc["id"],
+                        note=f"视频 refusal 连败计数: {str(exc)[:50]}")
+                    if snap and snap.get("video_frozen_until"):
+                        log.warning("【风控熔断】账号 %s refusal 达 3 次，视频链路冻结 7 天（至 %s）",
+                                    cur_acc["id"],
+                                    time.strftime("%Y-%m-%d %H:%M",
+                                                  time.localtime(snap["video_frozen_until"])))
             except MuseGenerationError as exc:
                 last_exc = exc
                 store.mark(cur_acc["id"], True, f"任务异常: {str(exc)[:60]}")
@@ -3216,6 +3229,18 @@ def rebind_account(aid: str, _=Depends(auth)):
     return {"rebound": True, "id": aid, "binding": acc.get("binding")}
 
 
+@app.post("/admin/accounts/{aid}/video-thaw")
+def thaw_video_account(aid: str, _=Depends(auth)):
+    """patch30：手动解冻视频熔断（refusal×3 自动冻结 7 天的人工豁免）。"""
+    acc = store.thaw_account(aid)
+    if not acc:
+        raise HTTPException(404, "账号不存在")
+    log.info("【风控熔断】账号 %s 人工解冻视频熔断", aid)
+    return {"thawed": True, "id": aid,
+            "video_fail_streak": acc.get("video_fail_streak", 0),
+            "video_frozen_until": acc.get("video_frozen_until")}
+
+
 @app.post("/admin/accounts/{aid}/refingerprint")
 def refingerprint_account(aid: str, _=Depends(auth)):
     """patch17：为账号换新设备身份（新 seed → 新指纹档案）。"""
@@ -4083,6 +4108,11 @@ async def _tetherpool_heartbeat():
     log.info("【TetherPool】心跳线程启动（间隔 300s，只补缺失绑定）")
     while True:
         try:
+            # patch30：视频熔断到期账号自动解冻（7 天）——放在心跳每轮开头，
+            # 与 pick_account 的懒判定双保险（懒判定保证到期即可用，这里落盘
+            # 清字段供 admin 视图/审计）。
+            for aid in store.thaw_due_accounts():
+                log.info("【风控熔断】账号 %s 视频冻结到期，自动解冻", aid)
             for acc in store.list_accounts():
                 _px = acc.get("proxy")
                 # patch17b（P2 根修）：跳过条件收紧——「非托管且有显式自建

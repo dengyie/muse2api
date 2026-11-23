@@ -52,6 +52,14 @@ _LOCK = threading.Lock()
 # hatch_vml 是可选工作区令牌，缺失不能据此拒绝会话导入
 ESSENTIAL_COOKIES = ("hatch_sess",)
 
+# patch30：账号视频风控熔断——连续 3 次「模型只回文本」（refusal，疑似账号级
+# 风控信号）冻结该账号视频链路 7 天（VIDEO_FREEZE_DAYS）。超时/附件断链/
+# 代理错等链路或上游故障不计入（11-23 上游 503 故障窗实证：全池皆然，
+# 计入会连环误冻）。冻结 = pick/acquire 跳过（不接新任务），不动 cookies/
+# 出口绑定，到期自动解冻（thaw_due），成功一次即清零计数。
+VIDEO_REFUSAL_FREEZE_AT = 3
+VIDEO_FREEZE_DAYS = 7
+
 
 # ---------------- patch17：每账号稳定指纹档案 ----------------
 # 目的：号池规模化时，账号之间互不相同、单账号跨重启稳定（设备身份隔离）。
@@ -331,6 +339,12 @@ class Store:
             live = [a for a in self.accounts if a.get("enabled", True) and a.get("cookies")]
             if not live:
                 return None
+            # patch30：视频熔断冻结中的账号不接新任务（懒判定：到期即视为可用，
+            # 无需等心跳解冻）。仅当存在非冻结候选时收紧；全冻结则放行兜底
+            # （可用性优先——全池熔断时宁可碰风控也不整体停摆）。
+            not_frozen = [a for a in live if not self.video_frozen(a)]
+            if not_frozen:
+                live = not_frozen
             blocked = set(exclude_ids or [])
             if exclude_id:
                 blocked.add(exclude_id)
@@ -402,6 +416,76 @@ class Store:
                     a["note"] = note[:300]
                     a["checked_at"] = int(time.time())
             _write(self.cfg.accounts_file, self.accounts)
+
+    # ---------------- patch30：视频风控熔断（refusal×3 冻结 7 天） ----------------
+    @staticmethod
+    def video_frozen(account: dict) -> bool:
+        """账号视频链路是否处于熔断冻结期（到期为假，懒判定不落盘）。"""
+        until = account.get("video_frozen_until") or 0
+        return bool(until) and time.time() < until
+
+    def record_video_refusal(self, aid: str, note: str = "") -> dict | None:
+        """视频 refusal（模型只回文本）计数 +1；达阈值冻结视频链路 VIDEO_FREEZE_DAYS 天。
+
+        返回账号快照（含 frozen 标志）供日志/审计；账号不存在返回 None。
+        成功生成（video_fail_streak 清零）见 record_video_success。
+        """
+        with _LOCK:
+            for a in self.accounts:
+                if a["id"] == aid:
+                    # 已在冻结期：不再累计（冻结本身就是隔离，避免解冻前堆计数）
+                    if self.video_frozen(a):
+                        return dict(a)
+                    streak = (a.get("video_fail_streak") or 0) + 1
+                    a["video_fail_streak"] = streak
+                    frozen = streak >= VIDEO_REFUSAL_FREEZE_AT
+                    if frozen:
+                        a["video_frozen_until"] = int(
+                            time.time() + VIDEO_FREEZE_DAYS * 86400)
+                        a["video_fail_streak"] = 0  # 冻结即清零，解冻后重新计
+                    if note:
+                        a["note"] = note[:300]
+                    a["checked_at"] = int(time.time())
+                    _write(self.cfg.accounts_file, self.accounts)
+                    return dict(a)
+            return None
+
+    def record_video_success(self, aid: str):
+        """视频生成成功 → 清零 refusal 连败计数（隔离期间不调用——成功即不在隔离）。"""
+        with _LOCK:
+            for a in self.accounts:
+                if a["id"] == aid and a.get("video_fail_streak"):
+                    a["video_fail_streak"] = 0
+                    _write(self.cfg.accounts_file, self.accounts)
+
+    def thaw_due_accounts(self) -> list[str]:
+        """冻结到期的账号自动解冻（心跳每轮调用）；返回本次解冻的账号 ID。"""
+        now_ts = int(time.time())
+        thawed = []
+        with _LOCK:
+            for a in self.accounts:
+                until = a.get("video_frozen_until") or 0
+                if until and now_ts >= until:
+                    a["video_frozen_until"] = None
+                    a["video_fail_streak"] = 0
+                    a["note"] = "视频熔断到期自动解冻"[:300]
+                    thawed.append(a["id"])
+            if thawed:
+                _write(self.cfg.accounts_file, self.accounts)
+        return thawed
+
+    def thaw_account(self, aid: str) -> dict | None:
+        """手动解冻（admin 操作）；返回更新后的账号，不存在返回 None。"""
+        with _LOCK:
+            for a in self.accounts:
+                if a["id"] == aid:
+                    a["video_frozen_until"] = None
+                    a["video_fail_streak"] = 0
+                    a["note"] = "人工解冻视频熔断"[:300]
+                    a["checked_at"] = int(time.time())
+                    _write(self.cfg.accounts_file, self.accounts)
+                    return dict(a)
+            return None
 
     def get_account(self, aid: str) -> dict | None:
         for a in self.accounts:
