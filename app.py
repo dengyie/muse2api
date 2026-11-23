@@ -3960,6 +3960,81 @@ def _warmup_browser_sync():
         GEN_LOCK.release()
 
 
+# ---------------- patch31：常驻登录锚点保活（页面级拟真 + cookie 收割）----------------
+# 纯 HTTP 续签只能延长活着的会话，救不活被 muse.ai 服务端吊销的会话（风控）。
+# 锚点保活让账号以真实浏览器页面保持「活人在线」画像：页面加载自己跑
+# /api/session + WS 握手，随后从页面收割最新 cookie 合并回账号池（复用
+# _sync_cookies 的合并语义——expires 只增不覆盖）。出口与生成链路共用同一
+# 绑定（粘性）；与生成互斥走账号租约非阻塞试拿，忙则跳过本轮绝不硬抢。
+# 节流状态放内存 dict（重启即冷启动，全部账号按最旧排序补一轮，无需持久化）。
+ANCHOR_LAST: dict[str, float] = {}
+
+
+def _anchor_keepalive_sync() -> dict | None:
+    """为最久未页面保活的健康账号做一次页面级保活 + cookie 收割。
+
+    返回摘要 dict（未做任何动作返回 None）。失败只告警不抛——保活链路
+    绝不能干扰主业务（对齐 _sync_cookies 的兜底哲学）。
+    """
+    if not CFG.anchor_keepalive_enabled:
+        return None
+    now = time.time()
+    candidates = []
+    for a in store.list_accounts():
+        if not a.get("enabled", True):
+            continue
+        # 只保活健康账号：ok=False（401 死号）页面加载必然失败，浪费一次
+        # 上游访问还可能加深风控画像；死号复活靠重新导号，不靠保活。
+        if a.get("ok") is not True:
+            continue
+        if store.video_frozen(a):
+            continue
+        candidates.append(a)
+    if not candidates:
+        return None
+    # 最久未页面保活优先（从未保活 = 0 最旧）；并列取 last_used 最旧——
+    # 与生成粘性同一排序哲学，页面保活顺势「养」生成链路最常用的账号。
+    candidates.sort(key=lambda a: (ANCHOR_LAST.get(a["id"], 0.0),
+                                   a.get("last_used") or 0.0))
+    acc = candidates[0]
+    if now - ANCHOR_LAST.get(acc["id"], 0.0) < CFG.anchor_keepalive_interval:
+        return None
+    # 账号租约非阻塞试拿：生成中/检测中 → 本轮跳过（不 409 硬抢）。
+    with ACCOUNT_POOL.cond:
+        if acc["id"] in ACCOUNT_POOL.busy_accounts:
+            return None
+        ACCOUNT_POOL.busy_accounts.add(acc["id"])
+    try:
+        log.info("【锚点保活】账号 %s (%s) 开始页面级拟真保活...", acc.get("label"), acc["id"])
+        ANCHOR_LAST[acc["id"]] = now  # 先记时间戳：失败也节流，防止每 15min 重试轰炸
+        refreshed = _renew_and_persist(acc["id"], wake_vm=True, force=False) or acc
+        _bind_account_proxy(refreshed)
+        engine.start()
+        engine.ensure_page(refreshed["cookies"], refreshed.get("cookies_exp"),
+                           account_id=acc["id"])
+        # 页面已就绪（thread/new + WS）：收割最新 cookie 合并回池。
+        # ensure_page 内部已跑过 /api/session（600s 节流内复用），此处页面
+        # 加载是「活人在线」的关键动作——比裸 HTTP 多了完整浏览器画像。
+        synced = _sync_cookies(acc["id"])
+        log.info("【锚点保活】账号 %s (%s) 页面保活完成，cookie 收割 %s",
+                 acc.get("label"), acc["id"],
+                 {k: synced.get(k) for k in ("synced", "changed") if k in synced})
+        return {"id": acc["id"], "label": acc.get("label"), "synced": synced.get("synced")}
+    except MuseAuthError:
+        # 续签判死：把时间戳推远避免反复撞 401（账号已 mark(False)，下轮
+        # 候选过滤自然跳过，这里双保险）。
+        ANCHOR_LAST[acc["id"]] = now
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log.warning("【锚点保活】账号 %s 页面保活失败（下轮再试）: %s",
+                    acc.get("id"), str(exc)[:200])
+        return None
+    finally:
+        engine.close_current_page()
+        _clear_account_proxy()
+        ACCOUNT_POOL.release(acc["id"])
+
+
 async def _keepalive_loop():
     """后台常驻守护任务：每 15 分钟轮询一次账号健康状态并保持 VM 热备，同时静默同步仓库更新。"""
     log.info("【自动保活守护进程】已启动，检测周期: 15 分钟")
@@ -3981,6 +4056,15 @@ async def _keepalive_loop():
             await run_keepalive_all(force=False)
         except Exception as e:  # noqa: BLE001
             log.error("【自动保活守护进程】轮询异常: %s", e)
+        # patch31：锚点保活——每轮最多为 1 个账号做页面级拟真保活（间隔
+        # 节流在 _anchor_keepalive_sync 内部），账号多时按 900s/个 轮转覆盖。
+        if CFG.anchor_keepalive_enabled:
+            try:
+                await asyncio.to_thread(_anchor_keepalive_sync)
+            except MuseAuthError:
+                pass  # 判死已由 _renew_and_persist mark(False)，候选过滤自然跳过
+            except Exception as e:  # noqa: BLE001
+                log.warning("【锚点保活】异常: %s", str(e)[:120])
         try:
             await asyncio.to_thread(_cleanup_expired_media)
         except Exception as e:  # noqa: BLE001

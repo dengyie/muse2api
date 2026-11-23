@@ -184,6 +184,20 @@ class Config:
         default_factory=lambda: _env("MUSE2API_TETHERPOOL_AVOID_CN_CIDRS",
                                      "183.193.0.0/16"))
 
+    # ---- patch31：常驻登录锚点保活（页面级拟真保活 + cookie 收割）----
+    # 背景：纯 HTTP 续签（renew_session_http）只能延长活着的会话，救不活被
+    # muse.ai 服务端吊销的会话（风控/异地登录）；页面级保活让账号保持
+    # 「活人在线」画像——真实浏览器加载 muse.ai/thread/new（页面自己跑
+    # /api/session + WS 握手），随后从页面收割最新 cookie 合并回账号池。
+    # 出口与生成链路共用同一绑定（粘性，零新漂移）；与生成互斥走账号租约
+    # （非阻塞试拿，忙则跳过本轮，绝不硬抢）。
+    anchor_keepalive_enabled: bool = field(
+        default_factory=lambda: _env("MUSE2API_ANCHOR_KEEPALIVE", "1").strip() != "0")
+    # 页面级保活最小间隔（秒）：单账号两次页面活动之间的下限。keepalive loop
+    # 每 900s 跑一轮，每轮最多为 1 个账号做页面保活（轮转最久未保活的）。
+    anchor_keepalive_interval: int = field(
+        default_factory=lambda: max(300, int(_env("MUSE2API_ANCHOR_INTERVAL", "3600"))))
+
     @property
     def data_dir(self) -> str:
         return os.path.join(self.base_dir, "data")
