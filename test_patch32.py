@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""test_patch32 — 生成路径重绑失败自愈回归（真实 TestClient 模式）。
+"""test_patch32 — 生成路径重绑失败自愈回归（FakeEngine 驱动 _run_generation_locked 状态机）。
 
 2026-11-24 实证 task_89b34124718047cfb037：锚点保活撞坏出口同秒生成任务
 拿同一出口 → MuseProxyError → 重绑 acquire 撞控制面瞬时不可达（Max
@@ -12,19 +12,19 @@ patch32 修复点（app._run_generation_locked）：
      时退避 15s 重试 acquire 一次（成功则 rebound=True/rebound_failed=False）
   2. 切号分支单号池原地重试条件放宽：rebound or rebound_failed
   3. 原语义不变：重绑成功（rebound=True）照旧原地重试
+  4. review P2-2：退避期 on_stage("rebind_backoff") 透传（轮询端可见）
 
-测试策略：不驱动完整生成循环（GEN_LOCK/engine 重依赖）——结构断言钉死
-两处分支的条件表达式 + _TPStub 行为语义（acquire 失败→重试链路），
-与 test_patch22r「结构」断言同型。
+行为级测试（review P2-1 根修）：FakeEngine/FakeAccountPool 真实驱动
+_run_generation_locked（test_patch28 模式移植），不再只靠结构断言。
+结构断言保留作防回退护栏。
 """
 import os
 import re
 import sys
-import tempfile
+import time
+import types
 
 _here = os.path.dirname(os.path.abspath(__file__))
-TMP = tempfile.mkdtemp(prefix="m2a-p32-test-")
-os.environ["MUSE2API_HOME"] = TMP
 sys.path.insert(0, _here)
 
 PASS = FAIL = 0
@@ -39,64 +39,222 @@ def check(name, cond, detail=""):
         print("FAIL: %s %s" % (name, detail))
 
 
-# 纯文本 + 自包含 stub——不 import app（本地 pip 装不上 fastapi，
-# 容器内跑全量回归时由 test_patch22r 等真实 TestClient 套件覆盖运行语义）。
-
-# ---------------- 1. 结构断言：重绑失败退避分支存在且语义正确 ----------------
-print("== 1. 结构断言（patch32 两处改动） ==")
-src = open(os.path.join(_here, "app.py"), encoding="utf-8").read()
-
-check("1.1 rebound_failed 初始化", "rebound_failed = False" in src)
-check("1.2 重绑失败置 rebound_failed", "rebound_failed = True" in src)
-check("1.3 退避重试 sleep(15)", "time.sleep(15)" in src)
-check("1.4 退避有 deadline 闸门", "deadline - 30" in src)
-check("1.5 重试成功恢复标记", "rebound_failed = False" in src)
-# 切号分支放宽条件：rebound or rebound_failed
-m = re.search(r"if \(isinstance\(last_exc, MuseProxyError\)\s*\n\s*and \(rebound or rebound_failed\)", src)
-check("1.6 单号池原地重试放宽 (rebound or rebound_failed)", bool(m))
-# 旧单条件（只看 rebound）已不存在
-m_old = re.search(r"isinstance\(last_exc, MuseProxyError\) and rebound\b", src)
-check("1.7 旧单条件已移除", m_old is None)
-
-# ---------------- 2. 退避重试行为（stub TP 驱动真实 except 分支语义） ----------------
-print("== 2. _TPStub 语义：acquire 失败→重试链 ==")
-CALLS = {"acquire": 0}
+import warnings
+warnings.filterwarnings("ignore")
+import app  # noqa: E402
+from engine import MuseProxyError  # noqa: E402
 
 
-class _TPFlaky:
-    """模拟控制面瞬时不可达：首次 acquire 抛异常（返回 None 语义），二次成功。"""
+class _FakeAccountPool:
+    """单号池语义：acquire 永远返回同一账号（rotate 时也拿不到备用号）。"""
 
-    def acquire(self, aid, force=False, constraints=None):
-        CALLS["acquire"] += 1
-        if CALLS["acquire"] == 1:
-            raise ConnectionError("Max retries exceeded (控制面瞬时不可达)")
-        return {"server": "http://10.144.144.9:9101/",
-                "username": aid + "__type_warp_ipv6__service_muse2api",
-                "password": "tpw",
-                "_binding": {"node_id": "azure-india-warp-42",
-                             "region": "india"}}
+    def __init__(self, acc):
+        self.acc = acc
+        self.rotate_calls = 0
+        self.released = []
 
-    def report_proxy_error(self, aid, node_name=None, event_type="proxy_error",
-                           rebind=False):
+    def acquire(self, account_id=None, preferred_id=None, rotate=False,
+                force_rotate=False, timeout=None, **kw):
+        if force_rotate:
+            self.rotate_calls += 1
+            return dict(self.acc)  # 单号池：切号仍返回同号 → alt["id"]==old_id
+        return dict(self.acc)
+
+    def release(self, aid):
+        self.released.append(aid)
+
+    @property
+    def cond(self):
+        import threading
+        return threading.Lock()
+
+    busy_accounts = set()
+
+
+class _FakeEngine:
+    """generate 行为由外部脚本控制；页面管理方法全部空转。"""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []
+        self.started = 0
+        self._last_http_renew = {}  # app 侧生成循环 finally 清理该缓存
+
+    def generate(self, cookies, prompt, expect=None, timeout=None, **kw):
+        self.calls.append(prompt)
+        action = self.script.pop(0)
+        if isinstance(action, Exception):
+            raise action
+        return action
+
+    def start(self):
+        self.started += 1
+
+    def close_current_page(self):
+        pass
+
+    def reset_thread(self):
         pass
 
 
-def reset_tp():
-    CALLS["acquire"] = 0
+class _TPStub:
+    """控制面客户端 stub：acquire 行为按脚本序列（None=控制面不可达）。"""
+
+    def __init__(self, acquire_script):
+        self.script = list(acquire_script)
+        self.acquire_calls = 0
+        self.reported = []
+
+    def acquire(self, aid, force=False, constraints=None):
+        self.acquire_calls += 1
+        action = self.script.pop(0) if self.script else None
+        if isinstance(action, Exception):
+            raise action
+        if action is None:
+            return None  # 控制面瞬时不可达 → acquire 静默兜底返回 None
+        proxy = dict(action)
+        proxy["_binding"] = {"node_id": "azure-india-warp-42", "region": "india"}
+        return proxy
+
+    def report_proxy_error(self, aid, node_name=None, event_type="proxy_error",
+                           rebind=False):
+        self.reported.append((aid, event_type))
 
 
-# 驱动 app.MuseProxyError except 分支的等价路径：直接调用该分支同款
-# 「acquire 失败→退避→重试」序列，验证第二次 acquire 拿到新出口。
-# （真实分支内部逻辑已由 1.x 结构断言钉死。）
-reset_tp()
-tp = _TPFlaky()
-got = None
+GOOD_PROXY = {"server": "http://10.144.144.9:9101/",
+              "username": "x__type_warp_ipv6__service_muse2api",
+              "password": "tpw"}
+
+
+def _install(stub, acc_id="f519883a14b2"):
+    saved = {}
+    for name in ("ACCOUNT_POOL", "engine", "TP", "tetherpool",
+                 "_renew_and_persist", "_sync_cookies", "_bind_account_proxy",
+                 "_clear_account_proxy"):
+        saved[name] = getattr(app, name)
+        setattr(app, name, stub.get(name, saved[name]))
+    return saved
+
+
+def _restore(saved):
+    for name, val in saved.items():
+        setattr(app, name, val)
+
+
+def _setup_case(gen_script, tp_script, acc=None):
+    acc = acc or {"id": "f519883a14b2", "label": "p32", "enabled": True,
+                  "cookies": {"hatch_sess": "s32"}, "cookies_exp": {},
+                  "proxy": dict(GOOD_PROXY),
+                  "binding": {"node_id": "huawei-sg-warp-25", "region": "singapore"}}
+    pool = _FakeAccountPool(acc)
+    eng = _FakeEngine(gen_script)
+    tp = _TPStub(tp_script)
+    saved = _install({"ACCOUNT_POOL": pool, "engine": eng, "TP": tp,
+                      "tetherpool": types.SimpleNamespace(
+                          enabled=lambda: True,
+                          is_managed=lambda p: bool(p and p.get("server")),
+                          is_cn_region=lambda r: bool(r) and str(r).lower().startswith("cn")),
+                      "_renew_and_persist": lambda *a, **k: None,
+                      "_sync_cookies": lambda *a, **k: None,
+                      "_bind_account_proxy": lambda *a, **k: None,
+                      "_clear_account_proxy": lambda *a, **k: None})
+    real_mark = app.store.mark
+    app.store.mark = lambda *a, **k: None
+    real_touch = app.store.touch_keepalive
+    app.store.touch_keepalive = lambda *a, **k: None
+    return pool, eng, tp, saved, real_mark, real_touch
+
+
+RESULT_OK = {"url": "http://x/video.mp4"}
+
+# ---------------- 1. 行为级：acquire 失败→退避重试成功→原地重试→成功 ----------------
+print("== 1. 行为级：退避重试成功后原地重试产出 ==")
+pool, eng, tp, saved, real_mark, real_touch = _setup_case(
+    [MuseProxyError("proxy dead"), RESULT_OK],
+    [None, GOOD_PROXY])  # 首次 acquire 控制面不可达(None)，重试成功
+stages = []
 try:
-    got = tp.acquire("e10e6310e8fe", force=True, constraints={"region": "singapore"})
-except Exception:
-    got = tp.acquire("e10e6310e8fe", force=True, constraints={"region": "singapore"})
-check("2.1 首次失败二次成功拿到新出口", got is not None and got["_binding"]["node_id"] == "azure-india-warp-42")
-check("2.2 acquire 恰好两次（退避一次不风暴）", CALLS["acquire"] == 2)
+    t0 = time.monotonic()
+    res, aid = app._run_generation_locked("一只猫", "video", 600,
+                                          on_stage=lambda s: stages.append(s))
+    elapsed = time.monotonic() - t0
+    check("1.1 退避重试后第二轮成功", res == RESULT_OK and aid == "f519883a14b2", (res, aid))
+    check("1.2 generate 恰 2 次（原地重试非秒死）", len(eng.calls) == 2, len(eng.calls))
+    check("1.3 acquire 恰 2 次（退避一次）", tp.acquire_calls == 2, tp.acquire_calls)
+    check("1.4 退避真实发生（elapsed>=15s）", elapsed >= 14.5, round(elapsed, 1))
+    check("1.5 battery 事件已上报", tp.reported == [("f519883a14b2", "proxy_error")], tp.reported)
+    check("1.6 退避期 stage 透传（review P2-2）", "rebind_backoff" in stages, stages)
+finally:
+    app.store.mark = real_mark
+    app.store.touch_keepalive = real_touch
+    _restore(saved)
 
-print("PASS=%d FAIL=%d" % (PASS, FAIL))
+# ---------------- 2. 行为级：退避后仍失败 → rebound_failed 原地重试 → 成功 ----------------
+print("== 2. 行为级：rebound_failed 放宽原地重试 ==")
+pool, eng, tp, saved, real_mark, real_touch = _setup_case(
+    [MuseProxyError("proxy dead"), RESULT_OK],
+    [None, None])  # 两次 acquire 都不可达（控制面恢复中）
+try:
+    raised = None
+    res = None
+    try:
+        res, aid = app._run_generation_locked("一只猫", "video", 600)
+    except Exception as e:  # noqa: BLE001
+        raised = e
+    # 场景推演：轮1 ProxyError → acquire None → 退避重试仍 None → rebound_failed
+    #   → 轮2 原地重试（rebound_failed 放宽）→ generate 成功
+    check("2.1 退避彻底失败仍原地重试并成功（patch32 核心）",
+          res == RESULT_OK and raised is None, (res, raised))
+    check("2.2 generate 恰 2 次", len(eng.calls) == 2, len(eng.calls))
+    check("2.3 acquire 恰 2 次", tp.acquire_calls == 2, tp.acquire_calls)
+finally:
+    app.store.mark = real_mark
+    app.store.touch_keepalive = real_touch
+    _restore(saved)
+
+# ---------------- 3. 行为级：deadline 临近不退避直接原地重试 ----------------
+print("== 3. 行为级：deadline-30 闸门跳过退避 ==")
+pool, eng, tp, saved, real_mark, real_touch = _setup_case(
+    [MuseProxyError("proxy dead"), RESULT_OK],
+    [None])
+try:
+    t0 = time.monotonic()
+    res, aid = app._run_generation_locked(
+        "一只猫", "video", 600, deadline=time.monotonic() + 20)  # 剩余<30s
+    elapsed = time.monotonic() - t0
+    check("3.1 deadline 不足跳过退避（无 15s sleep）", elapsed < 10, round(elapsed, 1))
+    check("3.2 仍原地重试并成功（rebound_failed 放宽）",
+          res == RESULT_OK and len(eng.calls) == 2, (res, len(eng.calls)))
+finally:
+    app.store.mark = real_mark
+    app.store.touch_keepalive = real_touch
+    _restore(saved)
+
+# ---------------- 4. 行为级：重绑成功（rebound=True）原语义不变 ----------------
+print("== 4. 行为级：重绑成功路径回归 ==")
+pool, eng, tp, saved, real_mark, real_touch = _setup_case(
+    [MuseProxyError("proxy dead"), RESULT_OK],
+    [GOOD_PROXY])  # 首次 acquire 即成功（patch17e 原语义）
+try:
+    res, aid = app._run_generation_locked("一只猫", "video", 600)
+    check("4.1 重绑成功原地重试产出（原语义）",
+          res == RESULT_OK and len(eng.calls) == 2, (res, len(eng.calls)))
+    check("4.2 acquire 恰 1 次（成功路径不退避）", tp.acquire_calls == 1, tp.acquire_calls)
+finally:
+    app.store.mark = real_mark
+    app.store.touch_keepalive = real_touch
+    _restore(saved)
+
+# ---------------- 5. 结构断言（防回退护栏） ----------------
+print("== 5. 结构断言 ==")
+src = open(os.path.join(_here, "app.py"), encoding="utf-8").read()
+check("5.1 rebound_failed 初始化", "rebound_failed = False" in src)
+check("5.2 退避有 deadline 闸门", "deadline - 30" in src)
+check("5.3 单号池原地重试放宽 (rebound or rebound_failed)",
+      bool(re.search(r"and \(rebound or rebound_failed\)", src)))
+check("5.4 旧单条件已移除",
+      re.search(r"isinstance\(last_exc, MuseProxyError\) and rebound\b", src) is None)
+check("5.5 rebind_backoff stage 透传", 'on_stage("rebind_backoff")' in src)
+
+print("\n== 结果: %d PASS / %d FAIL ==" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

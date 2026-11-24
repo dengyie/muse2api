@@ -380,7 +380,7 @@
           <button class="secondary" id="btnKeepaliveAll" onclick="keepaliveAll()" style="font-size:12px;padding:6px 14px">⚡ 一键保活所有账号</button>
         </div>
       </div>
-      <div class="hint" data-i18n="keepalive-hint">系统已开启<b>后台每 30 分钟静默保活</b>与<b>多账号公平轮转（LRU）</b>；「测试」会真实打开 muse.ai 验证会话。</div>
+      <div class="hint" data-i18n="keepalive-hint">系统已开启<b>后台每 15 分钟静默保活</b>（近 6h 内已保活且会话充足的账号自动跳过）与<b>多账号公平轮转（LRU）</b>；「测试」会真实打开 muse.ai 验证会话。</div>
       <div class="tblwrap"><table>
         <thead><tr>
           <th>标签</th><th>账号 ID</th><th>状态</th><th>有效期</th><th>额度</th><th data-i18n="col-enabled">启用</th><th>Cookie</th>
@@ -1267,7 +1267,7 @@ const I18N_EN_HTML = {
   "auth-banner": "\n      <b>Enter your API Key first so the page can load data</b><br>\n      <span style=\"color:var(--muted)\">\n        The API Key is this service's own \"access password\". It stops other people from using your Muse account quota.\n        It is <b style=\"color:var(--text)\">not</b> your Muse password. It is a random string generated at deploy time (it starts with <code>m2a_</code>).<br>\n        Paste it into the box at the top right and click \"Save\". Your browser remembers it, so you won't need to enter it again.\n      </span>\n    ",
   "model-names-hint": "\n        Model names: <code>muse-spark</code> (chat/code), <code>muse-image</code> (images), <code>muse-video</code> (videos).\n        See the \"Integration Docs\" tab for full examples.\n      ",
   "add-account-hint": "\n        Copy the <b>muse.ai</b> cookie string from your browser and paste it here. Required cookies:\n        <code>hatch_sess</code>. <code>hatch_vml</code> is an optional workspace token and does not block import.\n        For batch import, put one account per line in the format <code>label | cookie string</code> (label is optional).\n      ",
-  "keepalive-hint": "The system runs <b>a silent background keep-alive every 30 minutes</b> and <b>fair multi-account rotation (LRU)</b>. \"Test\" actually opens muse.ai to verify the session.",
+  "keepalive-hint": "The system runs <b>a silent background keep-alive every 15 minutes</b> (accounts kept alive recently with sufficient session are skipped) and <b>fair multi-account rotation (LRU)</b>. \"Test\" actually opens muse.ai to verify the session.",
   "ext-why-hint": "\n        A small browser extension syncs <b>the muse.ai login you already have on your own computer</b>.\n        No Python, no terminal, no commands.<br>\n        <b>Why an extension is required</b>: muse.ai's login session cookie is marked\n        <code>httpOnly</code>, so page scripts (typing <code>document.cookie</code> in F12,\n        bookmarklets) can't read them. Only a browser extension's <code>cookies</code> API can.\n      ",
   "ext-unzip-hint": "\n            Unzip it to a folder you won't delete, e.g. <code>D:\\muse2api-extension</code>.\n          ",
   "ext-load-steps": "\n            <li>Type <code>chrome://extensions</code> in the address bar and press Enter</li>\n            <li>Turn on the <b>Developer mode</b> switch at the top right</li>\n            <li>Click <b>Load unpacked</b> at the top left</li>\n            <li>Select the <b>folder</b> you unzipped in step 1 (not a single file inside it)</li>\n          ",

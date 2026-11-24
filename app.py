@@ -1492,14 +1492,20 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                         # patch32：重绑虽未成功但属控制面瞬时不可达（rebound_failed）
                         # ——下一轮 _bind_account_proxy/心跳可能已拿到新出口，同样
                         # 给一次原地重试机会；deadline 由循环顶部统一兜底。
+                        # 行为级测试实证（test_patch32 场景1）：原实现用 continue
+                        # 回循环顶，下一轮 attempt 又先进本切号分支且被
+                        # attempt+1<3 封顶 → break，generate 第二次从未执行——
+                        # 「原地重试」自 patch17e 起实际从未生效。改为不 break 不
+                        # continue，直接落到下方生成（本轮 attempt 正常消耗，
+                        # for range(3) 自然终止，无死循环）。
                         if (isinstance(last_exc, MuseProxyError)
                                 and (rebound or rebound_failed)
                                 and attempt + 1 < 3):
                             log.info("【TetherPool】重绑%s，单号池原地重试 %s (%s)",
                                      "已完成" if rebound else "暂未成功（控制面恢复中），",
                                      cur_acc.get("label"), cur_acc["id"])
-                            continue
-                        break
+                        else:
+                            break
                     log.info("【生图/视频自动切号】切换到备用账号 %s (%s) 重试...", cur_acc.get("label"), cur_acc["id"])
             # 上游 1.6.11 语义：每次 attempt（含首次）都上报账号归属（TaskTiming.account
             # 记录 task.account/attempt，失败任务也保留账号溯源）。
@@ -1573,6 +1579,13 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                         rebound_failed = True
                         if time.monotonic() < deadline - 30:
                             log.warning("【TetherPool】账号 %s 重绑失败（控制面瞬时不可达？），15s 后重试一次", cur_acc["id"])
+                            # review P2-2：退避期透传 stage——轮询端可见
+                            # 「等控制面恢复」而非任务卡死的静默窗。
+                            if on_stage:
+                                try:
+                                    on_stage("rebind_backoff")
+                                except Exception:  # noqa: BLE001 — 回调异常不干扰重试链
+                                    pass
                             time.sleep(15)
                             try:
                                 new_proxy = TP.acquire(
@@ -3327,59 +3340,67 @@ async def test_account(aid: str, _=Depends(auth)):
         raise HTTPException(400, "该账号没有 cookie")
 
     def _probe():
-        with GEN_LOCK, _account_operation(aid) as acc:
-            try:
-                engine.start()
+        # patch32(P4)：GEN_LOCK 限时抢锁（60s）——原 with 无限阻塞，8 槽满载
+        # 时巡检挂 60s+（keepalive 预热/生成高峰实测撞过）。超时 423 明确
+        # 报错，语义不变（探针仍与生成互斥，只是不再无限等）。
+        if not GEN_LOCK.acquire(timeout=60):
+            raise HTTPException(423, "生成并发已满（8 槽），探针暂无法执行；稍后重试")
+        try:
+            with _account_operation(aid) as acc:
                 try:
-                    engine.refresh(acc["cookies"], acc.get("cookies_exp"), account_id=aid)
-                except MuseProxyError:
-                    # patch25：直调路径撞出口单点故障——上报+重绑后用新出口重试一次。
-                    acc = _rebind_on_proxy_error(aid, acc)
-                    if not acc:
-                        raise
-                    engine.refresh(acc["cookies"], acc.get("cookies_exp"), account_id=aid)
-                synced = _sync_cookies(aid)
-                quota = None
-                quota_error = None
-                try:  # Session validity and quota readability are independent results.
-                    quota = engine.quota(acc["cookies"],
-                                         acc.get("cookies_exp"), account_id=aid)
-                    if quota.get("found"):
-                        quota["checked_at"] = int(time.time())
-                        store.update_account(aid, quota=quota)
-                    else:
-                        quota_error = "额度面板未读到有效数据；旧缓存未覆盖"
-                        quota = None
-                except MuseProxyError as exc:
-                    # patch25：quota 读取撞出口故障也重绑重试（refresh 已成功时
-                    # 通常是出口在两次调用间抖动）。
-                    acc2 = _rebind_on_proxy_error(aid, acc)
-                    if acc2:
-                        try:
-                            quota = engine.quota(acc2["cookies"],
-                                                 acc2.get("cookies_exp"), account_id=aid)
-                            if quota.get("found"):
-                                quota["checked_at"] = int(time.time())
-                                store.update_account(aid, quota=quota)
-                            else:
-                                quota_error = "额度面板未读到有效数据；旧缓存未覆盖"
-                                quota = None
-                        except Exception as exc2:  # noqa: BLE001
-                            quota_error = f"{type(exc2).__name__}；额度缓存未更新"
-                    else:
+                    engine.start()
+                    try:
+                        engine.refresh(acc["cookies"], acc.get("cookies_exp"), account_id=aid)
+                    except MuseProxyError:
+                        # patch25：直调路径撞出口单点故障——上报+重绑后用新出口重试一次。
+                        acc = _rebind_on_proxy_error(aid, acc)
+                        if not acc:
+                            raise
+                        engine.refresh(acc["cookies"], acc.get("cookies_exp"), account_id=aid)
+                    synced = _sync_cookies(aid)
+                    quota = None
+                    quota_error = None
+                    try:  # Session validity and quota readability are independent results.
+                        quota = engine.quota(acc["cookies"],
+                                             acc.get("cookies_exp"), account_id=aid)
+                        if quota.get("found"):
+                            quota["checked_at"] = int(time.time())
+                            store.update_account(aid, quota=quota)
+                        else:
+                            quota_error = "额度面板未读到有效数据；旧缓存未覆盖"
+                            quota = None
+                    except MuseProxyError as exc:
+                        # patch25：quota 读取撞出口故障也重绑重试（refresh 已成功时
+                        # 通常是出口在两次调用间抖动）。
+                        acc2 = _rebind_on_proxy_error(aid, acc)
+                        if acc2:
+                            try:
+                                quota = engine.quota(acc2["cookies"],
+                                                     acc2.get("cookies_exp"), account_id=aid)
+                                if quota.get("found"):
+                                    quota["checked_at"] = int(time.time())
+                                    store.update_account(aid, quota=quota)
+                                else:
+                                    quota_error = "额度面板未读到有效数据；旧缓存未覆盖"
+                                    quota = None
+                            except Exception as exc2:  # noqa: BLE001
+                                quota_error = f"{type(exc2).__name__}；额度缓存未更新"
+                        else:
+                            quota_error = f"{type(exc).__name__}；额度缓存未更新"
+                    except Exception as exc:  # noqa: BLE001
                         quota_error = f"{type(exc).__name__}；额度缓存未更新"
+                    store.mark(aid, True, "会话有效" + ("；额度读取失败" if quota_error else ""))
+                    return {"ok": True, "message": "会话有效，可正常生成",
+                            "synced": synced, "quota": quota,
+                            "quota_error": quota_error}
+                except MuseAuthError as exc:
+                    store.mark(aid, False, str(exc)[:200])
+                    return {"ok": False, "message": str(exc)[:200]}
                 except Exception as exc:  # noqa: BLE001
-                    quota_error = f"{type(exc).__name__}；额度缓存未更新"
-                store.mark(aid, True, "会话有效" + ("；额度读取失败" if quota_error else ""))
-                return {"ok": True, "message": "会话有效，可正常生成",
-                        "synced": synced, "quota": quota,
-                        "quota_error": quota_error}
-            except MuseAuthError as exc:
-                store.mark(aid, False, str(exc)[:200])
-                return {"ok": False, "message": str(exc)[:200]}
-            except Exception as exc:  # noqa: BLE001
-                store.touch_keepalive(aid, None, f"测试未确认（保留账号状态）: {str(exc)[:200]}")
-                return {"ok": False, "message": str(exc)[:200]}
+                    store.touch_keepalive(aid, None, f"测试未确认（保留账号状态）: {str(exc)[:200]}")
+                    return {"ok": False, "message": str(exc)[:200]}
+        finally:
+            GEN_LOCK.release()
 
     res = await asyncio.to_thread(_probe)
     if not res["ok"]:
@@ -3396,57 +3417,63 @@ async def attach_probe(aid: str, _=Depends(auth)):
         raise HTTPException(404, "账号不存在")
 
     def _probe():
-        with GEN_LOCK, _account_operation(aid) as acc:
-            try:
-                engine.start()
-                _mode = "reuse"
+        # patch32(P4)：GEN_LOCK 限时抢锁（60s）——原 with 无限阻塞挂巡检。
+        if not GEN_LOCK.acquire(timeout=60):
+            raise HTTPException(423, "生成并发已满（8 槽），探针暂无法执行；稍后重试")
+        try:
+            with _account_operation(aid) as acc:
                 try:
-                    page = engine.ensure_page(acc["cookies"], acc.get("cookies_exp"),
-                                              account_id=aid)
-                except MuseProxyError:
-                    # patch25：直调路径撞出口单点故障不再直接 502——上报+重绑后
-                    # 用新出口重试一次（对齐生成链路 patch17e 语义）。
-                    acc = _rebind_on_proxy_error(aid, acc)
-                    if not acc:
-                        raise
-                    page = engine.ensure_page(acc["cookies"], acc.get("cookies_exp"),
-                                              account_id=aid)
-                # patch22h 验证：先试重用页，attach 失败自动换全新页再试一次——
-                # 定位「API 进程重用页失败 / 外部进程新开页成功」的状态差异。
-                _attempts = []
-                info1 = _composer_probe_js(page)  # round 0 成功路径也要有 before 现场
-                for _round in range(2):
+                    engine.start()
+                    _mode = "reuse"
                     try:
-                        res = engine._attach_images([_tiny_png()])
-                        _attempts.append({"round": _round, "mode": _mode, "ok": True})
-                        info2 = page.js("""(function(){
-                            return JSON.stringify({remove_btns:Array.from(document.querySelectorAll('button[aria-label]'))
-                                .map(function(b){return b.getAttribute('aria-label');})
-                                .filter(function(a){return /remove|attachment/i.test(a||'');})});
-                        })()""")
-                        return {"ok": True, "before": info1, "after": info2,
-                                "attempts": _attempts, "attach": True}
-                    except Exception as _ae:
-                        _attempts.append({"round": _round, "mode": _mode,
-                                          "ok": False, "err": str(_ae)[:120],
-                                          # patch22m：失败现场留档——否则 round0 的
-                                          # DOM 状态只存在于日志，排障要翻日志拼时间线
-                                          "scene": _composer_probe_js(page)})
-                        # 换全新页再试
-                        page = engine.refresh(acc["cookies"], acc.get("cookies_exp"),
-                                              account_id=aid)
-                        _mode = "fresh"
-                        info1 = _composer_probe_js(page)
-                return {"ok": False, "before": info1, "attempts": _attempts}
-            except Exception as exc:  # noqa: BLE001
-                # patch22g4d：失败时也带 before 现场（诊断信息不能被异常吞掉）
-                _before = ""
-                try:
-                    _before = info1  # noqa: F821
-                except Exception:
-                    pass
-                return {"ok": False, "before": _before,
-                        "error": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
+                        page = engine.ensure_page(acc["cookies"], acc.get("cookies_exp"),
+                                                  account_id=aid)
+                    except MuseProxyError:
+                        # patch25：直调路径撞出口单点故障不再直接 502——上报+重绑后
+                        # 用新出口重试一次（对齐生成链路 patch17e 语义）。
+                        acc = _rebind_on_proxy_error(aid, acc)
+                        if not acc:
+                            raise
+                        page = engine.ensure_page(acc["cookies"], acc.get("cookies_exp"),
+                                                  account_id=aid)
+                    # patch22h 验证：先试重用页，attach 失败自动换全新页再试一次——
+                    # 定位「API 进程重用页失败 / 外部进程新开页成功」的状态差异。
+                    _attempts = []
+                    info1 = _composer_probe_js(page)  # round 0 成功路径也要有 before 现场
+                    for _round in range(2):
+                        try:
+                            res = engine._attach_images([_tiny_png()])
+                            _attempts.append({"round": _round, "mode": _mode, "ok": True})
+                            info2 = page.js("""(function(){
+                                return JSON.stringify({remove_btns:Array.from(document.querySelectorAll('button[aria-label]'))
+                                    .map(function(b){return b.getAttribute('aria-label');})
+                                    .filter(function(a){return /remove|attachment/i.test(a||'');})});
+                            })()""")
+                            return {"ok": True, "before": info1, "after": info2,
+                                    "attempts": _attempts, "attach": True}
+                        except Exception as _ae:
+                            _attempts.append({"round": _round, "mode": _mode,
+                                              "ok": False, "err": str(_ae)[:120],
+                                              # patch22m：失败现场留档——否则 round0 的
+                                              # DOM 状态只存在于日志，排障要翻日志拼时间线
+                                              "scene": _composer_probe_js(page)})
+                            # 换全新页再试
+                            page = engine.refresh(acc["cookies"], acc.get("cookies_exp"),
+                                                  account_id=aid)
+                            _mode = "fresh"
+                            info1 = _composer_probe_js(page)
+                    return {"ok": False, "before": info1, "attempts": _attempts}
+                except Exception as exc:  # noqa: BLE001
+                    # patch22g4d：失败时也带 before 现场（诊断信息不能被异常吞掉）
+                    _before = ""
+                    try:
+                        _before = info1  # noqa: F821
+                    except Exception:
+                        pass
+                    return {"ok": False, "before": _before,
+                            "error": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
+        finally:
+            GEN_LOCK.release()
 
     return await asyncio.to_thread(_probe)
 
@@ -3505,10 +3532,16 @@ def relogin(_=Depends(auth)):
     if not acc:
         raise HTTPException(400, "没有可用账号")
     try:
-        with GEN_LOCK, _account_operation(acc["id"]) as selected:
-            engine.start()
-            engine.refresh(selected["cookies"], selected.get("cookies_exp"), account_id=selected["id"])
-            return {"ok": True, "account": selected["id"]}
+        # patch32(P4)：GEN_LOCK 限时抢锁（60s）——原 with 无限阻塞挂管理操作。
+        if not GEN_LOCK.acquire(timeout=60):
+            raise HTTPException(423, "生成并发已满（8 槽），relogin 暂无法执行；稍后重试")
+        try:
+            with _account_operation(acc["id"]) as selected:
+                engine.start()
+                engine.refresh(selected["cookies"], selected.get("cookies_exp"), account_id=selected["id"])
+                return {"ok": True, "account": selected["id"]}
+        finally:
+            GEN_LOCK.release()
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -3531,21 +3564,27 @@ async def query_quota(aid: str, _=Depends(auth)):
         raise HTTPException(400, "该账号没有 cookie")
 
     def _probe():
-        with GEN_LOCK, _account_operation(aid) as acc:
-            engine.start()
-            try:
-                q = engine.quota(acc["cookies"], acc.get("cookies_exp"), account_id=aid)
-            except MuseProxyError:
-                # patch25：直调路径撞出口单点故障——上报+重绑后用新出口重试一次。
-                acc = _rebind_on_proxy_error(aid, acc)
-                if not acc:
-                    raise
-                q = engine.quota(acc["cookies"], acc.get("cookies_exp"), account_id=aid)
-            if not q.get("found"):
-                raise MuseGenerationError("额度面板未读到有效数据；旧缓存未覆盖")
-            q["checked_at"] = int(time.time())
-            store.update_account(aid, quota=q)
-            return q
+        # patch32(P4)：GEN_LOCK 限时抢锁（60s）——原 with 无限阻塞挂管理操作。
+        if not GEN_LOCK.acquire(timeout=60):
+            raise HTTPException(423, "生成并发已满（8 槽），额度查询暂无法执行；稍后重试")
+        try:
+            with _account_operation(aid) as acc:
+                engine.start()
+                try:
+                    q = engine.quota(acc["cookies"], acc.get("cookies_exp"), account_id=aid)
+                except MuseProxyError:
+                    # patch25：直调路径撞出口单点故障——上报+重绑后用新出口重试一次。
+                    acc = _rebind_on_proxy_error(aid, acc)
+                    if not acc:
+                        raise
+                    q = engine.quota(acc["cookies"], acc.get("cookies_exp"), account_id=aid)
+                if not q.get("found"):
+                    raise MuseGenerationError("额度面板未读到有效数据；旧缓存未覆盖")
+                q["checked_at"] = int(time.time())
+                store.update_account(aid, quota=q)
+                return q
+        finally:
+            GEN_LOCK.release()
 
     try:
         return await asyncio.to_thread(_probe)
@@ -3972,8 +4011,11 @@ async def run_keepalive_all(force: bool = False) -> dict:
 
 def _warmup_browser_sync():
     """后台静默预热浏览器与首个可用账号的 WebSocket 隧道，使重启后首条请求也秒回。"""
-    if getattr(engine, "current_acc_id", None) and engine.page is not None:
-        return
+    # patch32：删除 thread-local 死守卫——engine.current_acc_id/page 是
+    # threading.local 属性，本函数经 asyncio.to_thread 在全新线程上运行，
+    # 二者恒为 None，守卫永不命中（Explore R6 定性）。当前唯一调用点
+    # （keepalive loop 启动期一次）+ finally 无条件关页，删守卫零行为
+    # 变化；防未来把预热改成周期执行时被这个恒 False 的守卫误导。
     if not GEN_LOCK.acquire(blocking=False):
         return
     acc = None
@@ -4006,9 +4048,11 @@ def _warmup_browser_sync():
 ANCHOR_LAST: dict[str, float] = {}
 
 
-def _anchor_keepalive_sync() -> dict | None:
+def _anchor_keepalive_sync(force: bool = False) -> dict | None:
     """为最久未页面保活的健康账号做一次页面级保活 + cookie 收割。
 
+    force=True（patch32 P5：admin 手动触发）绕过 interval 节流，但健康过滤
+    与账号租约互斥照旧——手动也绝不硬抢生成中的账号。loop 侧默认 False。
     返回摘要 dict（未做任何动作返回 None）。失败只告警不抛——保活链路
     绝不能干扰主业务（对齐 _sync_cookies 的兜底哲学）。
     """
@@ -4033,7 +4077,7 @@ def _anchor_keepalive_sync() -> dict | None:
     candidates.sort(key=lambda a: (ANCHOR_LAST.get(a["id"], 0.0),
                                    a.get("last_used") or 0.0))
     acc = candidates[0]
-    if now - ANCHOR_LAST.get(acc["id"], 0.0) < CFG.anchor_keepalive_interval:
+    if not force and now - ANCHOR_LAST.get(acc["id"], 0.0) < CFG.anchor_keepalive_interval:
         return None
     # 账号租约非阻塞试拿：生成中/检测中 → 本轮跳过（不 409 硬抢）。
     with ACCOUNT_POOL.cond:
@@ -4120,6 +4164,26 @@ async def trigger_keepalive_all(force: bool = True, _=Depends(auth)):
 async def trigger_keepalive_single(aid: str, _=Depends(auth)):
     """手动针对单个账号执行保活续期。"""
     return await asyncio.to_thread(_probe_account_sync, aid, False)
+
+
+@app.post("/admin/anchor-keepalive")
+async def trigger_anchor_keepalive(_=Depends(auth)):
+    """patch32(P5)：手动触发一次锚点保活（页面级拟真保活 + cookie 收割）。
+
+    force 绕过 interval 节流（选定最久未保活的健康账号立刻执行）；开关关闭 /
+    无健康候选 / 账号忙（生成互斥不硬抢）时返回 triggered=False 而非报错——
+    保活链路不干扰主业务，管理面同样对齐这个语义。"""
+    if not CFG.anchor_keepalive_enabled:
+        return {"status": "disabled", "triggered": False,
+                "message": "锚点保活开关已关闭（MUSE2API_ANCHOR_KEEPALIVE=0）"}
+    try:
+        r = await asyncio.to_thread(_anchor_keepalive_sync, True)
+    except MuseAuthError as e:
+        raise HTTPException(502, f"锚点保活判定账号会话失效: {str(e)[:120]}")
+    if not r:
+        return {"status": "skipped", "triggered": False,
+                "message": "无可用候选（无健康账号）或目标账号正被生成占用（互斥不硬抢）"}
+    return {"status": "ok", "triggered": True, "account": r}
 
 
 @app.get("/admin/keepalive/status")
