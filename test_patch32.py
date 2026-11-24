@@ -162,14 +162,19 @@ def _setup_case(gen_script, tp_script, acc=None):
     app.store.mark = lambda *a, **k: None
     real_touch = app.store.touch_keepalive
     app.store.touch_keepalive = lambda *a, **k: None
-    return pool, eng, tp, saved, real_mark, real_touch
+    # 行为级 stub：patch32 重绑成功后 store.update_account 会写回账号档案；
+    # 假账号不在真实 store 里（data/accounts.json 缺省不存在），真身返回 None
+    # 会让 cur_acc["id"] TypeError。stub 回传合并后的账号 dict 即可。
+    real_update = app.store.update_account
+    app.store.update_account = lambda aid, **kw: {**acc, **kw}
+    return pool, eng, tp, saved, real_mark, real_touch, real_update
 
 
 RESULT_OK = {"url": "http://x/video.mp4"}
 
 # ---------------- 1. 行为级：acquire 失败→退避重试成功→原地重试→成功 ----------------
 print("== 1. 行为级：退避重试成功后原地重试产出 ==")
-pool, eng, tp, saved, real_mark, real_touch = _setup_case(
+pool, eng, tp, saved, real_mark, real_touch, real_update = _setup_case(
     [MuseProxyError("proxy dead"), RESULT_OK],
     [None, GOOD_PROXY])  # 首次 acquire 控制面不可达(None)，重试成功
 stages = []
@@ -187,11 +192,12 @@ try:
 finally:
     app.store.mark = real_mark
     app.store.touch_keepalive = real_touch
+    app.store.update_account = real_update
     _restore(saved)
 
 # ---------------- 2. 行为级：退避后仍失败 → rebound_failed 原地重试 → 成功 ----------------
 print("== 2. 行为级：rebound_failed 放宽原地重试 ==")
-pool, eng, tp, saved, real_mark, real_touch = _setup_case(
+pool, eng, tp, saved, real_mark, real_touch, real_update = _setup_case(
     [MuseProxyError("proxy dead"), RESULT_OK],
     [None, None])  # 两次 acquire 都不可达（控制面恢复中）
 try:
@@ -210,11 +216,12 @@ try:
 finally:
     app.store.mark = real_mark
     app.store.touch_keepalive = real_touch
+    app.store.update_account = real_update
     _restore(saved)
 
 # ---------------- 3. 行为级：deadline 临近不退避直接原地重试 ----------------
 print("== 3. 行为级：deadline-30 闸门跳过退避 ==")
-pool, eng, tp, saved, real_mark, real_touch = _setup_case(
+pool, eng, tp, saved, real_mark, real_touch, real_update = _setup_case(
     [MuseProxyError("proxy dead"), RESULT_OK],
     [None])
 try:
@@ -228,11 +235,12 @@ try:
 finally:
     app.store.mark = real_mark
     app.store.touch_keepalive = real_touch
+    app.store.update_account = real_update
     _restore(saved)
 
 # ---------------- 4. 行为级：重绑成功（rebound=True）原语义不变 ----------------
 print("== 4. 行为级：重绑成功路径回归 ==")
-pool, eng, tp, saved, real_mark, real_touch = _setup_case(
+pool, eng, tp, saved, real_mark, real_touch, real_update = _setup_case(
     [MuseProxyError("proxy dead"), RESULT_OK],
     [GOOD_PROXY])  # 首次 acquire 即成功（patch17e 原语义）
 try:
@@ -243,6 +251,7 @@ try:
 finally:
     app.store.mark = real_mark
     app.store.touch_keepalive = real_touch
+    app.store.update_account = real_update
     _restore(saved)
 
 # ---------------- 5. 结构断言（防回退护栏） ----------------

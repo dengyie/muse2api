@@ -1502,7 +1502,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                                 and (rebound or rebound_failed)
                                 and attempt + 1 < 3):
                             log.info("【TetherPool】重绑%s，单号池原地重试 %s (%s)",
-                                     "已完成" if rebound else "暂未成功（控制面恢复中），",
+                                     "已完成" if rebound else "暂未成功（控制面恢复中）",
                                      cur_acc.get("label"), cur_acc["id"])
                         else:
                             break
