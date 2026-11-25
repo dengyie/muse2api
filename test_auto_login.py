@@ -10,6 +10,7 @@ from auto_login import _allowed_muse_url
 from config import Config
 from credentials import (
     _extract_muse_code_or_link,
+    _parse_mail_ts,
     generate_totp,
     mask_identifier,
     public_auth_profile,
@@ -81,6 +82,13 @@ class TestCredentials(unittest.TestCase):
         self.assertFalse(_allowed_muse_url("https://evilmuse.ai/login"))
         self.assertFalse(_allowed_muse_url("javascript:alert(1)"))
 
+    def test_parse_mail_ts(self):
+        ts1 = _parse_mail_ts("2026-11-25 10:15:00")
+        ts2 = _parse_mail_ts("2026-11-25T10:15:00.123Z")
+        self.assertIsNotNone(ts1)
+        self.assertEqual(ts1, ts2)
+        self.assertIsNone(_parse_mail_ts("bad"))
+
 
 class TestStoreAuthProfile(unittest.TestCase):
     def test_pending_account_and_auth_profile_lifecycle(self):
@@ -116,6 +124,19 @@ class TestStoreAuthProfile(unittest.TestCase):
 
             st.clear_auth_profile(aid)
             self.assertIsNone(st.get_account(aid).get("auth_profile"))
+
+    def test_find_by_hatch_sess_and_identifier(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(base_dir=tmp)
+            cfg.ensure_dirs()
+            st = Store(cfg)
+            a1 = st.add_account({"hatch_sess": "sess_abc"}, label="a1")
+            st.set_auth_profile(a1["id"], {"identifier": "User@Example.com", "auth_type": "password"})
+            a2 = st.add_pending_account(label="a2")
+            self.assertEqual(st.find_by_hatch_sess("sess_abc", exclude_aid=a2["id"])["id"], a1["id"])
+            self.assertIsNone(st.find_by_hatch_sess("sess_abc", exclude_aid=a1["id"]))
+            self.assertEqual(st.find_by_identifier("user@example.com")["id"], a1["id"])
+            self.assertIsNone(st.find_by_identifier("other@example.com"))
 
 
 if __name__ == "__main__":

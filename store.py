@@ -330,6 +330,32 @@ class Store:
             _write(self.cfg.accounts_file, self.accounts)
             return len(self.accounts) != n
 
+    def find_by_hatch_sess(self, sess: str, exclude_aid: str | None = None) -> dict | None:
+        """查找持有相同 hatch_sess 的其他账号（防自动登录产生双档案）。"""
+        if not sess:
+            return None
+        with _LOCK:
+            for a in self.accounts:
+                if exclude_aid and a.get("id") == exclude_aid:
+                    continue
+                if (a.get("cookies") or {}).get("hatch_sess") == sess:
+                    return a
+        return None
+
+    def find_by_identifier(self, identifier: str, exclude_aid: str | None = None) -> dict | None:
+        """查找已绑定相同登录标识（邮箱/用户名）的账号。"""
+        target = (identifier or "").strip().lower()
+        if not target:
+            return None
+        with _LOCK:
+            for a in self.accounts:
+                if exclude_aid and a.get("id") == exclude_aid:
+                    continue
+                ident = ((a.get("auth_profile") or {}).get("identifier") or "").strip().lower()
+                if ident and ident == target:
+                    return a
+        return None
+
     def add_pending_account(self, label: str = "", auth_profile: dict | None = None,
                             aid: str | None = None) -> dict:
         """创建待登录账号（无初始 cookie，靠自动登录获取会话）。"""

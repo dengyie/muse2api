@@ -126,7 +126,28 @@ def _fill_visible_input(page: CDP, selectors: list[str], value: str) -> bool:
     page.send("Input.dispatchKeyEvent", {"type": "keyDown", "key": "Backspace", "code": "Backspace"})
     page.send("Input.dispatchKeyEvent", {"type": "keyUp", "key": "Backspace", "code": "Backspace"})
     page.send("Input.insertText", {"text": value})
-    return True
+    # Verify input received value (fallback to React nativeInputValueSetter if needed)
+    filled_ok = page.js(f"""(() => {{
+        const sels = {json.dumps(selectors)};
+        const vis = e => e.getClientRects().length > 0
+            && getComputedStyle(e).visibility !== 'hidden'
+            && !e.disabled && !e.readOnly;
+        for (const s of sels) {{
+            const el = [...document.querySelectorAll(s)].find(vis);
+            if (el) {{
+                if ((el.value || '').length > 0) return true;
+                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                if (setter) {{
+                    setter.call(el, {json.dumps(value)});
+                    el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    return (el.value || '').length > 0;
+                }}
+            }}
+        }}
+        return false;
+    }})()""")
+    return bool(filled_ok)
 
 
 def _submit_form(page: CDP) -> None:
@@ -229,8 +250,7 @@ def run_auto_login(engine, acc: dict, auth_profile: dict, cred_key: str,
     if auth_type == "email_otp" and not onemail_jwt:
         return AutoLoginResult(ok=False, error="邮箱 OTP 模式缺少 One-Mail JWT", stage="init")
 
-    if not getattr(engine, "browser", None):
-        engine.start()
+    engine.start()
     if not getattr(engine, "browser", None):
         return AutoLoginResult(ok=False, error="浏览器未就绪，无法执行自动登录", stage="browser")
 
@@ -350,10 +370,15 @@ def run_auto_login(engine, acc: dict, auth_profile: dict, cred_key: str,
                         needs_manual=True,
                         stage="otp_required",
                     )
-                code, magic_link = fetch_onemail_otp(
-                    onemail_base, onemail_jwt, since_ts=login_started_at,
-                    timeout=min(45.0, max(8.0, deadline - time.monotonic())),
-                )
+                try:
+                    code, magic_link = fetch_onemail_otp(
+                        onemail_base, onemail_jwt, since_ts=login_started_at,
+                        timeout=min(45.0, max(8.0, deadline - time.monotonic())),
+                    )
+                except ValueError as exc:
+                    return AutoLoginResult(
+                        ok=False, error=str(exc), needs_manual=True, stage="onemail_auth"
+                    )
                 if magic_link and _allowed_muse_url(magic_link):
                     page.send("Page.navigate", {"url": magic_link})
                     otp_submitted = True
@@ -373,14 +398,34 @@ def run_auto_login(engine, acc: dict, auth_profile: dict, cred_key: str,
                     ok=False, error="等待 One-Mail 邮箱验证码超时", stage="otp_timeout"
                 )
 
-            # 4. 密码输入框
+            # 4. 邮箱 + 密码（兼容同屏单步表单与两步表单）
             has_pw = bool(page.js(
                 "!![...document.querySelectorAll('input[type=password]')]"
                 ".find(e => e.getClientRects().length > 0)"
             ))
+            if not email_submitted:
+                if auth_type == "email_otp":
+                    clicked_email_btn = _click_button_matching(page, [r"continue with email|email me a code"])
+                    if clicked_email_btn:
+                        continue
+                email_sels = [
+                    'input[type="email"]',
+                    'input[autocomplete="email"]',
+                    'input[autocomplete="username"]',
+                    'input[name*="email"]',
+                    'input[name*="identifier"]',
+                    'input[name*="user"]',
+                    'input[type="text"]',
+                ]
+                if _fill_visible_input(page, email_sels, identifier):
+                    email_submitted = True
+                    # 若同屏已有密码框，先填密码再统一提交；否则先提交邮箱进入下一步
+                    if not has_pw:
+                        _submit_form(page)
+                        continue
+
             if has_pw:
                 if auth_type == "email_otp" and not otp_requested:
-                    # 优先切到邮箱验证码登录按钮
                     switched = _click_button_matching(page, [
                         r"email.*code|send.*code|one-time|use.*code|magic\s*link",
                     ])
@@ -392,25 +437,6 @@ def run_auto_login(engine, acc: dict, auth_profile: dict, cred_key: str,
                         _submit_form(page)
                         password_submitted = True
                         continue
-
-            # 5. 邮箱/用户名输入框
-            if not email_submitted:
-                # 若是邮箱 OTP 模式且当前页面有显式“Continue with Email”按钮，先点
-                if auth_type == "email_otp":
-                    _click_button_matching(page, [r"continue with email|email me a code"])
-                filled = _fill_visible_input(page, [
-                    'input[type="email"]',
-                    'input[autocomplete="email"]',
-                    'input[autocomplete="username"]',
-                    'input[name*="email"]',
-                    'input[name*="identifier"]',
-                    'input[name*="user"]',
-                    'input[type="text"]',
-                ], identifier)
-                if filled:
-                    _submit_form(page)
-                    email_submitted = True
-                    continue
 
             # 6. 错误提示检测（密码错误/账号不存在等，立即熔断不重试）
             if any(k in low_txt for k in (

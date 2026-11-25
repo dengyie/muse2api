@@ -134,14 +134,15 @@ def _parse_mail_ts(raw: str | None) -> float | None:
     if not raw:
         return None
     s = str(raw).strip()
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"):
-        try:
-            import calendar
-            tm = time.strptime(s[:19], fmt[:len(s[:19])] if "T" not in fmt else fmt)
-            return float(calendar.timegm(tm))
-        except ValueError:
-            continue
-    return None
+    if len(s) < 19:
+        return None
+    normalized = s[:19].replace("T", " ")
+    try:
+        import calendar
+        tm = time.strptime(normalized, "%Y-%m-%d %H:%M:%S")
+        return float(calendar.timegm(tm))
+    except ValueError:
+        return None
 
 
 def _extract_muse_code_or_link(mail: dict) -> tuple[str | None, str | None]:
@@ -185,6 +186,8 @@ def fetch_onemail_otp(base_url: str, jwt: str, since_ts: float,
         try:
             r = requests.get(f"{base}/api/verifcodes?fresh=5&limit=10",
                              headers=headers, timeout=8)
+            if r.status_code in (401, 403):
+                raise ValueError(f"One-Mail JWT 无效或已过期 (HTTP {r.status_code})")
             if r.status_code == 200:
                 results = (r.json() or {}).get("results") or []
                 for item in results:
@@ -196,6 +199,8 @@ def fetch_onemail_otp(base_url: str, jwt: str, since_ts: float,
                     if code and code.isdigit() and 4 <= len(code) <= 8:
                         if not src or any(k in src for k in ("muse", "meta", "hatch", "noreply", "no-reply")):
                             return code, None
+        except ValueError:
+            raise
         except Exception:
             pass
 
@@ -203,6 +208,8 @@ def fetch_onemail_otp(base_url: str, jwt: str, since_ts: float,
         try:
             r = requests.get(f"{base}/api/parsed_mails?limit=10&offset=0",
                              headers=headers, timeout=8)
+            if r.status_code in (401, 403):
+                raise ValueError(f"One-Mail JWT 无效或已过期 (HTTP {r.status_code})")
             if r.status_code == 200:
                 results = (r.json() or {}).get("results") or []
                 for mail in results:
@@ -212,6 +219,8 @@ def fetch_onemail_otp(base_url: str, jwt: str, since_ts: float,
                     code, link = _extract_muse_code_or_link(mail)
                     if code or link:
                         return code, link
+        except ValueError:
+            raise
         except Exception:
             pass
 

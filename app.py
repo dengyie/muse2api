@@ -3590,6 +3590,12 @@ def _auto_relogin_locked(aid: str, acc: dict, force: bool = False) -> dict:
         onemail_default_base=CFG.onemail_base_url,
     )
     if res.ok and res.cookies:
+        dup = store.find_by_hatch_sess(res.cookies.get("hatch_sess", ""), exclude_aid=aid)
+        if dup:
+            err = f"登录获得的会话已存在于账号「{dup.get('label') or dup['id']}」({dup['id']})，已拒绝重复写入"
+            store.record_relogin_result(aid, False, error=err, needs_manual=True)
+            return {"ok": False, "id": aid, "label": acc.get("label", aid),
+                    "error": err, "needs_manual": True, "stage": "duplicate_session"}
         now = int(time.time())
         store.update_account(
             aid,
@@ -3661,6 +3667,9 @@ def trigger_account_auto_login(aid: str, _=Depends(auth)):
 def create_account_with_login(req: CreateWithLoginRequest, _=Depends(auth)):
     """无需外部 Cookie，直接凭账号凭据创建账号并自动登录获取会话。"""
     prof = _build_auth_profile(req, None)
+    dup = store.find_by_identifier(prof["identifier"])
+    if dup:
+        raise HTTPException(409, f"该登录邮箱/用户名已绑定在账号「{dup.get('label') or dup['id']}」({dup['id']})")
     proxy = req.proxy.configuration() if req.proxy else None
     acc = store.add_pending_account(label=req.label or prof["identifier"], auth_profile=prof)
     aid = acc["id"]
