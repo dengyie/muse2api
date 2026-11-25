@@ -377,6 +377,7 @@
           <span class="badge ok" id="keepaliveBadge" style="font-size:11px">● 自动保活轮转中 (30m)</span>
         </div>
         <div style="display:flex;gap:8px">
+          <button class="secondary" onclick="openAuthProfile(null)" style="font-size:12px;padding:6px 14px">+ 凭据登录添加</button>
           <button class="secondary" id="btnKeepaliveAll" onclick="keepaliveAll()" style="font-size:12px;padding:6px 14px">⚡ 一键保活所有账号</button>
         </div>
       </div>
@@ -823,6 +824,44 @@ t = requests.post(<span class="s">"BASE/v1/videos"</span>, json={<span class="s"
       <button type="button" class="danger" id="proxyRemove">移除代理</button>
       <button type="button" class="ghost" onclick="$('proxyDialog').close()">取消</button>
       <button type="submit" id="proxySave">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="authDialog" class="proxy-dialog" aria-labelledby="authTitle">
+  <form id="authForm">
+    <h2 id="authTitle">自动登录凭据</h2>
+    <p class="hint">配置后，当会话 401 失效时系统将自动在同指纹、同代理的隔离浏览器中重新登录并恢复会话（触发人机验证时自动熔断）。</p>
+    <div id="authLabelWrap">
+      <label for="authLabel">账号标签（新建时可选）</label>
+      <input id="authLabel" type="text" placeholder="例如：muse-main" autocomplete="off">
+    </div>
+    <label for="authType">登录方式</label>
+    <select id="authType">
+      <option value="password">邮箱 + 密码（可选 TOTP 2FA / One-Mail 兜底）</option>
+      <option value="email_otp">邮箱 + OTP 验证码（One-Mail 自动收码）</option>
+    </select>
+    <label for="authIdentifier">登录邮箱 / 用户名</label>
+    <input id="authIdentifier" type="text" placeholder="you@example.com" autocomplete="off" spellcheck="false" required>
+    <div id="authPasswordWrap">
+      <label for="authPassword">登录密码（更新时留空保留原密码）</label>
+      <input id="authPassword" type="password" autocomplete="new-password">
+    </div>
+    <label for="authTotp">TOTP 2FA 密钥（可选，Base32，留空不修改）</label>
+    <input id="authTotp" type="password" placeholder="JBSWY3DPEHPK3PXP" autocomplete="new-password">
+    <label for="authOnemailBase">One-Mail API 地址（邮箱 OTP 用）</label>
+    <input id="authOnemailBase" type="text" placeholder="https://mail-api.mangoqwq.com" autocomplete="off" spellcheck="false">
+    <label for="authOnemailJwt">One-Mail Address JWT（邮箱 OTP 用，留空保留原值）</label>
+    <input id="authOnemailJwt" type="password" autocomplete="new-password">
+    <label style="display:flex;align-items:center;gap:6px;margin-top:8px">
+      <input id="authAutoRelogin" type="checkbox" checked style="width:auto">
+      <span>允许 401 时后台自动重登</span>
+    </label>
+    <div class="proxy-actions">
+      <button type="button" class="danger" id="authClear">清除凭据</button>
+      <button type="button" class="ghost" onclick="$('authDialog').close()">取消</button>
+      <button type="button" class="ghost" id="authSaveLogin">保存并立即登录</button>
+      <button type="submit" id="authSave">保存</button>
     </div>
   </form>
 </dialog>
@@ -1853,6 +1892,8 @@ async function loadPool(){
           <button class="ghost mini" data-act="proxy" data-id="${a.id}">代理</button>
           <button class="ghost mini" data-act="toggle" data-id="${a.id}" data-enabled="${a.enabled ? 1 : 0}">${a.enabled ? '禁用' : '启用'}</button>
           <button class="ghost mini" data-act="rename" data-id="${a.id}" data-label="${esc(a.label)}">改名</button>
+          <button class="ghost mini" data-act="auth" data-id="${a.id}">凭据${a.auth_profile ? '✓' : ''}</button>
+          ${a.auth_profile ? `<button class="ghost mini" data-act="autologin" data-id="${a.id}">自动登录</button>` : ''}
           <button class="ghost mini" data-act="cookies" data-id="${a.id}">更新Cookie</button>
           <button class="danger mini" data-act="del" data-id="${a.id}" data-label="${esc(a.label)}">删除</button>
         </div></td>
@@ -1877,6 +1918,8 @@ async function loadPool(){
     proxy: (id) => openProxy(id),
     toggle: (id, btn) => toggleAcc(id, btn.dataset.enabled !== '1'),
     rename: (id, btn) => renameAcc(id, btn.dataset.label || ''),
+    auth: (id) => openAuthProfile(id),
+    autologin: (id) => triggerAutoLogin(id),
     cookies: (id) => updateCookies(id),
     del: (id, btn) => delAcc(id, btn.dataset.label || ''),
   };
@@ -2081,6 +2124,79 @@ async function delAcc(id, label){
     toast('已删除', 'ok'); loadPool();
   }catch(e){ toast('删除失败：' + e.message, 'bad'); }
 }
+
+let authAccountId = null;
+function openAuthProfile(id){
+  authAccountId = id || null;
+  const acc = id ? accounts.find(a => a.id === id) : null;
+  const prof = acc && acc.auth_profile ? acc.auth_profile : null;
+  $('authTitle').textContent = id ? `自动登录凭据 · ${(acc && acc.label) || id}` : '凭据登录添加账号';
+  $('authLabelWrap').hidden = !!id;
+  $('authLabel').value = '';
+  $('authType').value = (prof && prof.auth_type) || 'password';
+  $('authIdentifier').value = '';
+  $('authIdentifier').placeholder = (prof && prof.identifier_masked) ? `已保存：${prof.identifier_masked}（留空保持不变）` : 'you@example.com';
+  $('authIdentifier').required = !prof;
+  $('authPassword').value = '';
+  $('authTotp').value = '';
+  $('authOnemailBase').value = (prof && prof.onemail_base) || 'https://mail-api.mangoqwq.com';
+  $('authOnemailJwt').value = '';
+  $('authAutoRelogin').checked = prof ? (prof.auto_relogin !== false) : true;
+  $('authClear').hidden = !(id && prof);
+  $('authSave').hidden = !id;
+  $('authSaveLogin').textContent = id ? '保存并立即登录' : '创建并自动登录';
+  $('authDialog').showModal();
+}
+
+async function saveAuthProfile(andLogin){
+  const body = {
+    auth_type: $('authType').value,
+    identifier: $('authIdentifier').value.trim(),
+    onemail_base: $('authOnemailBase').value.trim() || 'https://mail-api.mangoqwq.com',
+    auto_relogin: $('authAutoRelogin').checked,
+  };
+  if ($('authPassword').value) body.password = $('authPassword').value;
+  if ($('authTotp').value) body.totp_secret = $('authTotp').value;
+  if ($('authOnemailJwt').value) body.onemail_jwt = $('authOnemailJwt').value;
+  try{
+    if (!authAccountId){
+      body.label = $('authLabel').value.trim();
+      toast('正在创建账号并执行容器内自动登录，请稍候…');
+      const r = await api('/admin/accounts/create-with-login', {method:'POST', body: JSON.stringify(body)});
+      $('authDialog').close();
+      if (r.login && r.login.ok) toast('✓ 账号已创建并自动登录成功', 'ok');
+      else toast(`账号已创建，自动登录未完成：${(r.login && r.login.error) || '请检查凭据或远程登录'}`, 'warn');
+      loadPool();
+      return;
+    }
+    await api(`/admin/accounts/${authAccountId}/auth-profile`, {method:'PUT', body: JSON.stringify(body)});
+    $('authDialog').close();
+    toast('✓ 自动登录凭据已加密保存', 'ok');
+    if (andLogin) await triggerAutoLogin(authAccountId);
+    else loadPool();
+  }catch(e){ toast('保存失败：' + e.message, 'bad'); }
+}
+
+async function triggerAutoLogin(id){
+  toast('正在启动隔离浏览器自动登录 muse.ai…');
+  try{
+    const r = await api(`/admin/accounts/${id}/auto-login`, {method:'POST'});
+    toast(r.ok ? `✓ 自动登录成功（${r.cookie_count || 0} cookies）` : `✗ 自动登录失败：${r.error || '未知错误'}`, r.ok ? 'ok' : 'bad');
+    loadPool();
+  }catch(e){ toast('自动登录失败：' + e.message, 'bad'); }
+}
+
+$('authForm').addEventListener('submit', ev => { ev.preventDefault(); saveAuthProfile(false); });
+$('authSaveLogin').addEventListener('click', () => saveAuthProfile(true));
+$('authClear').addEventListener('click', async () => {
+  if (!authAccountId || !confirm('确定清除该账号保存的自动登录凭据？')) return;
+  try{
+    await api(`/admin/accounts/${authAccountId}/auth-profile`, {method:'DELETE'});
+    $('authDialog').close();
+    toast('已清除凭据', 'ok');
+    loadPool();
+  }catch(e){ toast('清除失败：' + e.message, 'bad'); }
+});
 
 /* ================= 任务记录 ================= */
 async function loadTasks(){

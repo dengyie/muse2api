@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 
+from credentials import public_auth_profile
 from proxy import public_proxy
 
 
@@ -298,12 +299,13 @@ class Store:
     @staticmethod
     def public_account(account: dict) -> dict:
         item = {k: v for k, v in account.items()
-                if k not in ("cookies", "proxy", "fingerprint")}
+                if k not in ("cookies", "proxy", "fingerprint", "auth_profile")}
         item["proxy"] = public_proxy(account.get("proxy"))
         item["cookie_count"] = len(account.get("cookies", {}))
         # patch17：指纹只出摘要（绝不含 seed）；binding 直接可见
         item["fingerprint"] = public_fingerprint(account.get("fingerprint"))
         item["binding"] = account.get("binding")
+        item["auth_profile"] = public_auth_profile(account.get("auth_profile"))
         return item
 
     def list_accounts(self) -> list[dict]:
@@ -327,6 +329,64 @@ class Store:
             self.accounts = [a for a in self.accounts if a["id"] != aid]
             _write(self.cfg.accounts_file, self.accounts)
             return len(self.accounts) != n
+
+    def add_pending_account(self, label: str = "", auth_profile: dict | None = None,
+                            aid: str | None = None) -> dict:
+        """创建待登录账号（无初始 cookie，靠自动登录获取会话）。"""
+        with _LOCK:
+            aid = (aid or uuid.uuid4().hex[:12]).strip() or uuid.uuid4().hex[:12]
+            now = int(time.time())
+            import secrets
+            acc = {"id": aid, "label": label or aid, "cookies": {},
+                   "cookies_exp": {}, "expires_at": None,
+                   "expiry_anchor": None,
+                   "enabled": True, "created_at": now,
+                   "last_used": None, "last_keepalive": None, "use_count": 0,
+                   "ok": None, "note": "待自动登录", "synced_at": None}
+            acc["fingerprint"] = derive_fingerprint(secrets.token_hex(16))
+            acc["binding"] = None
+            if auth_profile is not None:
+                acc["auth_profile"] = auth_profile
+            self.accounts.append(acc)
+            _write(self.cfg.accounts_file, self.accounts)
+            return acc
+
+    def set_auth_profile(self, aid: str, profile: dict) -> dict | None:
+        """保存或更新账号的加密自动登录凭据。"""
+        with _LOCK:
+            for a in self.accounts:
+                if a["id"] == aid:
+                    a["auth_profile"] = profile
+                    _write(self.cfg.accounts_file, self.accounts)
+                    return a
+            return None
+
+    def clear_auth_profile(self, aid: str) -> dict | None:
+        """清除账号的自动登录凭据。"""
+        with _LOCK:
+            for a in self.accounts:
+                if a["id"] == aid:
+                    a.pop("auth_profile", None)
+                    _write(self.cfg.accounts_file, self.accounts)
+                    return a
+            return None
+
+    def record_relogin_result(self, aid: str, ok: bool, error: str = "",
+                              needs_manual: bool = False) -> dict | None:
+        """记录自动登录结果与冷却/熔断状态。"""
+        with _LOCK:
+            now = int(time.time())
+            for a in self.accounts:
+                if a["id"] == aid:
+                    prof = dict(a.get("auth_profile") or {})
+                    prof["last_relogin_at"] = now
+                    prof["last_relogin_ok"] = ok
+                    prof["last_relogin_error"] = "" if ok else (error or "")[:200]
+                    prof["needs_manual"] = False if ok else bool(needs_manual)
+                    a["auth_profile"] = prof
+                    _write(self.cfg.accounts_file, self.accounts)
+                    return a
+            return None
 
     def pick_account(self, preferred_id: str | None = None, rotate: bool = True,
                      force_rotate: bool = False, exclude_id: str | None = None,

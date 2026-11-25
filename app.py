@@ -51,6 +51,8 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
 from pydantic import model_validator, BaseModel, Field, SecretStr, field_validator
 
 from config import CFG
+from auto_login import run_auto_login
+from credentials import seal_secret
 from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
                     MAX_REFERENCE_IMAGES, MAX_REFERENCE_TOTAL_BYTES,
                     REFERENCE_MIME_EXT, MuseAuthError, MuseEngine, MuseGenerationError,
@@ -828,6 +830,24 @@ def _egress_constraints(acc: dict | None = None, req=None) -> dict:
 
 class ProxyTestRequest(BaseModel):
     proxy: AccountProxy
+
+
+class AuthProfileRequest(BaseModel):
+    auth_type: str = "password"       # "password" | "email_otp"
+    identifier: str = ""
+    password: str | None = None
+    totp_secret: str | None = None
+    onemail_base: str | None = None
+    onemail_jwt: str | None = None
+    auto_relogin: bool = True
+
+
+class CreateWithLoginRequest(AuthProfileRequest):
+    label: str = ""
+    proxy: AccountProxy | None = None
+    region: str | None = None
+    region_strict: bool | None = None
+    egress: str | None = None
 
 
 # ------------------------- 提示词构造 -------------------------
@@ -3499,6 +3519,166 @@ def _composer_probe_js(page):
     })()""")
 
 
+def _ensure_credential_key() -> str:
+    """获取或自动生成并持久化凭据加密主密钥（MUSE2API_CREDENTIAL_KEY）。"""
+    key = (CFG.credential_key or "").strip()
+    if not key:
+        key = secrets.token_urlsafe(32)
+        CFG.credential_key = key
+        _persist_env("MUSE2API_CREDENTIAL_KEY", key)
+        log.info("🔐 未检测到 MUSE2API_CREDENTIAL_KEY，已自动生成并持久化至 runtime.env")
+    return key
+
+
+def _build_auth_profile(req: AuthProfileRequest, existing: dict | None = None) -> dict:
+    """构造并加密保存 auth_profile；更新时未传的敏感字段保留原密文。"""
+    auth_type = (req.auth_type or "password").strip().lower()
+    if auth_type not in ("password", "email_otp"):
+        raise HTTPException(400, "auth_type 仅支持 password 或 email_otp")
+    identifier = (req.identifier or "").strip() or (existing or {}).get("identifier", "")
+    if not identifier:
+        raise HTTPException(400, "请填写登录邮箱/用户名 (identifier)")
+    key = _ensure_credential_key()
+    prof = {
+        "auth_type": auth_type,
+        "identifier": identifier,
+        "password_enc": (existing or {}).get("password_enc", ""),
+        "totp_secret_enc": (existing or {}).get("totp_secret_enc", ""),
+        "onemail_base": (req.onemail_base if req.onemail_base is not None
+                         else (existing or {}).get("onemail_base") or CFG.onemail_base_url).strip(),
+        "onemail_jwt_enc": (existing or {}).get("onemail_jwt_enc", ""),
+        "auto_relogin": bool(req.auto_relogin),
+        "last_relogin_at": (existing or {}).get("last_relogin_at"),
+        "last_relogin_ok": (existing or {}).get("last_relogin_ok"),
+        "last_relogin_error": (existing or {}).get("last_relogin_error", ""),
+        "needs_manual": False,
+    }
+    if req.password is not None:
+        prof["password_enc"] = seal_secret(req.password, key) if req.password else ""
+    if req.totp_secret is not None:
+        prof["totp_secret_enc"] = seal_secret(req.totp_secret, key) if req.totp_secret else ""
+    if req.onemail_jwt is not None:
+        prof["onemail_jwt_enc"] = seal_secret(req.onemail_jwt, key) if req.onemail_jwt else ""
+
+    if auth_type == "password" and not prof["password_enc"]:
+        raise HTTPException(400, "密码登录模式必须提供 password")
+    if auth_type == "email_otp" and not prof["onemail_jwt_enc"]:
+        raise HTTPException(400, "邮箱 OTP 模式必须提供 One-Mail JWT (onemail_jwt)")
+    return prof
+
+
+def _auto_relogin_locked(aid: str, acc: dict, force: bool = False) -> dict:
+    """在已持有 _account_operation(aid) 租约的前提下执行自动登录并落库。"""
+    prof = acc.get("auth_profile")
+    if not prof:
+        return {"ok": False, "id": aid, "error": "账号未配置自动登录凭据"}
+    if not force:
+        if not CFG.auto_relogin_enabled or not prof.get("auto_relogin", True):
+            return {"ok": False, "id": aid, "skipped": True, "error": "自动重登未启用"}
+        if prof.get("needs_manual"):
+            return {"ok": False, "id": aid, "skipped": True, "needs_manual": True,
+                    "error": "账号已触发人工接管熔断，请先通过远程登录或手动重置"}
+        last_try = prof.get("last_relogin_at") or 0
+        if last_try and (time.time() - last_try) < CFG.auto_relogin_cooldown:
+            return {"ok": False, "id": aid, "skipped": True,
+                    "error": "自动重登冷却中，暂不重试"}
+    cred_key = _ensure_credential_key()
+    log.info("【自动重登】开始为账号 %s (%s) 执行容器内自动登录...", acc.get("label", aid), aid)
+    res = run_auto_login(
+        engine, acc, prof, cred_key,
+        timeout=CFG.auto_relogin_timeout,
+        onemail_default_base=CFG.onemail_base_url,
+    )
+    if res.ok and res.cookies:
+        now = int(time.time())
+        store.update_account(
+            aid,
+            cookies=res.cookies,
+            cookies_exp=res.cookies_exp,
+            expiry_anchor=now,
+            ok=True,
+            synced_at=now,
+            note="自动重登成功",
+        )
+        store.record_relogin_result(aid, True)
+        store.touch_keepalive(aid, True, "自动重登恢复会话")
+        engine._last_http_renew[aid] = now
+        updated = store.get_account(aid) or {}
+        log.info("【自动重登】账号 %s (%s) 登录成功，cookie=%d", acc.get("label", aid), aid, len(res.cookies))
+        return {
+            "ok": True,
+            "id": aid,
+            "label": acc.get("label", aid),
+            "cookie_count": len(res.cookies),
+            "expires_at": updated.get("expires_at"),
+            "auto_relogin": True,
+        }
+    store.record_relogin_result(aid, False, error=res.error, needs_manual=res.needs_manual)
+    store.touch_keepalive(aid, False, f"自动重登失败: {res.error[:180]}")
+    log.warning("【自动重登】账号 %s (%s) 失败 (stage=%s manual=%s): %s",
+                acc.get("label", aid), aid, res.stage, res.needs_manual, res.error)
+    return {
+        "ok": False,
+        "id": aid,
+        "label": acc.get("label", aid),
+        "error": res.error,
+        "needs_manual": res.needs_manual,
+        "stage": res.stage,
+    }
+
+
+@app.put("/admin/accounts/{aid}/auth-profile")
+def set_account_auth_profile(aid: str, req: AuthProfileRequest, _=Depends(auth)):
+    """为现有账号绑定或更新自动登录凭据（密文落盘，永不回显）。"""
+    existing = store.get_account(aid)
+    if not existing:
+        raise HTTPException(404, "账号不存在")
+    prof = _build_auth_profile(req, existing.get("auth_profile"))
+    acc = store.set_auth_profile(aid, prof)
+    return store.public_account(acc)
+
+
+@app.delete("/admin/accounts/{aid}/auth-profile")
+def delete_account_auth_profile(aid: str, _=Depends(auth)):
+    """清除账号的自动登录凭据。"""
+    acc = store.clear_auth_profile(aid)
+    if not acc:
+        raise HTTPException(404, "账号不存在")
+    return store.public_account(acc)
+
+
+@app.post("/admin/accounts/{aid}/auto-login")
+def trigger_account_auto_login(aid: str, _=Depends(auth)):
+    """立即为指定账号执行一次自动登录（绕过冷却与 needs_manual 熔断）。"""
+    with _account_operation(aid) as acc:
+        res = _auto_relogin_locked(aid, acc, force=True)
+        if not res.get("ok"):
+            return JSONResponse(res, status_code=502)
+        return res
+
+
+@app.post("/admin/accounts/create-with-login")
+def create_account_with_login(req: CreateWithLoginRequest, _=Depends(auth)):
+    """无需外部 Cookie，直接凭账号凭据创建账号并自动登录获取会话。"""
+    prof = _build_auth_profile(req, None)
+    proxy = req.proxy.configuration() if req.proxy else None
+    acc = store.add_pending_account(label=req.label or prof["identifier"], auth_profile=prof)
+    aid = acc["id"]
+    if proxy:
+        store.update_account(aid, proxy=proxy)
+    elif tetherpool.enabled():
+        try:
+            got = TP.acquire(aid, constraints=_egress_constraints(None, req))
+        except Exception:
+            got = None
+        if got:
+            store.update_account(aid, proxy=got, binding=got.get("_binding"))
+    with _account_operation(aid) as locked_acc:
+        res = _auto_relogin_locked(aid, locked_acc, force=True)
+    pub = store.public_account(store.get_account(aid) or acc)
+    return {"account": pub, "login": res}
+
+
 @app.post("/admin/accounts/{aid}/relogin")
 async def relogin_account(aid: str, _=Depends(auth)):
     return await test_account(aid, _)
@@ -3908,9 +4088,20 @@ def _probe_account_sync(aid: str, check_quota: bool = False) -> dict:
     try:
         with _account_operation(aid) as acc:
             if not acc.get("cookies"):
+                if acc.get("auth_profile") and CFG.auto_relogin_enabled:
+                    return _auto_relogin_locked(aid, acc, force=False)
                 return {"ok": False, "id": aid, "label": acc.get("label", aid), "error": "账号无有效 cookie"}
-            res = engine.renew_session_http(acc["cookies"], acc.get("cookies_exp"), wake_vm=True,
-                                            **({"proxy": _account_proxy(acc)} if _account_proxy(acc) else {}))
+            try:
+                res = engine.renew_session_http(acc["cookies"], acc.get("cookies_exp"), wake_vm=True,
+                                                **({"proxy": _account_proxy(acc)} if _account_proxy(acc) else {}))
+            except MuseAuthError as exc:
+                if acc.get("auth_profile") and CFG.auto_relogin_enabled:
+                    re_res = _auto_relogin_locked(aid, acc, force=False)
+                    if re_res.get("ok"):
+                        return re_res
+                    if not re_res.get("skipped"):
+                        return re_res
+                raise exc
             store.update_account(
                 aid,
                 cookies=res["cookies"],
@@ -4295,6 +4486,7 @@ async def _startup():
         log.info("🔑 未检测到 MUSE2API_KEY，已自动生成初始密钥（前缀 %s…，"
                  "完整值见 %s）", new_key[:8],
                  os.path.join(CFG.data_dir, "runtime.env"))
+    _ensure_credential_key()
     asyncio.create_task(_keepalive_loop())
     threading.Thread(target=MEDIA_BACKUPER.run_forever, daemon=True,
                      name="media-backup").start()

@@ -198,6 +198,18 @@ class Config:
     anchor_keepalive_interval: int = field(
         default_factory=lambda: max(300, int(_env("MUSE2API_ANCHOR_INTERVAL", "3600"))))
 
+    # ---- 自动登录与凭据加密（自维护登录态，脱离外部 Cookie 依赖）----
+    auto_relogin_enabled: bool = field(
+        default_factory=lambda: _env("MUSE2API_AUTO_RELOGIN", "1").strip() != "0")
+    auto_relogin_cooldown: int = field(
+        default_factory=lambda: max(300, int(_env("MUSE2API_AUTO_RELOGIN_COOLDOWN", "21600"))))
+    auto_relogin_timeout: int = field(
+        default_factory=lambda: max(30, int(_env("MUSE2API_AUTO_RELOGIN_TIMEOUT", "120"))))
+    credential_key: str = field(
+        default_factory=lambda: _env("MUSE2API_CREDENTIAL_KEY", ""))
+    onemail_base_url: str = field(
+        default_factory=lambda: _env("MUSE2API_ONEMAIL_BASE", "https://mail-api.mangoqwq.com"))
+
     @property
     def data_dir(self) -> str:
         return os.path.join(self.base_dir, "data")

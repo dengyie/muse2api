@@ -39,8 +39,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 复制代码与必要目录（二开模块 tetherpool/mediabak/idempotency + 上游新模块 generation_timing/thumbnails）
-COPY admin.html remote_login.html login_session.py app.py cdp.py config.py engine.py store.py proxy.py tetherpool.py mediabak.py idempotency.py updater.py generation_timing.py thumbnails.py version.json ./
+# 复制代码与必要目录（二开模块 tetherpool/mediabak/idempotency + 自动登录 credentials/auto_login + 上游新模块 generation_timing/thumbnails）
+COPY admin.html remote_login.html login_session.py credentials.py auto_login.py app.py cdp.py config.py engine.py store.py proxy.py tetherpool.py mediabak.py idempotency.py updater.py generation_timing.py thumbnails.py version.json ./
 COPY deploy/ ./deploy/
 COPY extension/ ./extension/
 COPY tools/ ./tools/
