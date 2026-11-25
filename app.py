@@ -3299,6 +3299,8 @@ def del_account(aid: str, _=Depends(auth)):
         raise HTTPException(404, "账号不存在")
     with ACCOUNT_POOL.cond:
         _PROXY_TEST_RECEIPTS.pop(aid, None)
+    ANCHOR_LAST.pop(aid, None)
+    engine._last_http_renew.pop(aid, None)
     return {"deleted": True, "id": aid, "binding_released": released}
 
 
@@ -3583,12 +3585,18 @@ def _auto_relogin_locked(aid: str, acc: dict, force: bool = False) -> dict:
             return {"ok": False, "id": aid, "skipped": True,
                     "error": "自动重登冷却中，暂不重试"}
     cred_key = _ensure_credential_key()
-    log.info("【自动重登】开始为账号 %s (%s) 执行容器内自动登录...", acc.get("label", aid), aid)
-    res = run_auto_login(
-        engine, acc, prof, cred_key,
-        timeout=CFG.auto_relogin_timeout,
-        onemail_default_base=CFG.onemail_base_url,
-    )
+    if not GEN_LOCK.acquire(timeout=60):
+        return {"ok": False, "id": aid, "skipped": True,
+                "error": "生成并发已满，自动登录稍后重试"}
+    try:
+        log.info("【自动重登】开始为账号 %s (%s) 执行容器内自动登录...", acc.get("label", aid), aid)
+        res = run_auto_login(
+            engine, acc, prof, cred_key,
+            timeout=CFG.auto_relogin_timeout,
+            onemail_default_base=CFG.onemail_base_url,
+        )
+    finally:
+        GEN_LOCK.release()
     if res.ok and res.cookies:
         dup = store.find_by_hatch_sess(res.cookies.get("hatch_sess", ""), exclude_aid=aid)
         if dup:
@@ -3684,6 +3692,14 @@ def create_account_with_login(req: CreateWithLoginRequest, _=Depends(auth)):
             store.update_account(aid, proxy=got, binding=got.get("_binding"))
     with _account_operation(aid) as locked_acc:
         res = _auto_relogin_locked(aid, locked_acc, force=True)
+    if res.get("stage") == "duplicate_session":
+        if tetherpool.enabled():
+            try:
+                TP.release(aid)
+            except Exception:
+                pass
+        store.delete_account(aid)
+        raise HTTPException(409, res.get("error") or "该 Muse 会话已存在")
     pub = store.public_account(store.get_account(aid) or acc)
     return {"account": pub, "login": res}
 

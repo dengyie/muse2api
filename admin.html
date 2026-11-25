@@ -1875,10 +1875,14 @@ async function loadPool(){
                   : ok === false ? '<span class="badge bad">● 异常</span>'
                   : '<span class="badge warn">○ 未检测</span>';
       const miss = a.essential_ok ? '' : ' <span class="badge bad" title="缺少核心 cookie，无法生成">缺核心</span>';
+      const ap = a.auth_profile;
+      const authBadge = !ap ? ''
+        : ap.needs_manual ? ` <span class="badge warn" title="${esc(ap.last_relogin_error || '需要人工接管')}">⚠️ 需人工</span>`
+        : ` <span class="badge info" title="${esc(ap.identifier_masked || '')}">${ap.auth_type === 'email_otp' ? '📧 OTP' : '🔑 密码'}</span>`;
       return `<tr>
         <td><b>${esc(a.label)}</b><div class="mono ellip proxy-summary" title="${esc(a.proxy?.server || '默认网络')}">${esc(a.proxy?.server || '默认网络')}</div>${proxyStatus(a)}</td>
         <td class="mono">${esc(a.id)}</td>
-        <td>${badge}${miss}</td>
+        <td>${badge}${miss}${authBadge}</td>
         <td>${expiryBadge(a)}</td>
         <td>${quotaBadge(a)}</td>
         <td>${a.enabled ? '<span class="badge ok">开</span>' : '<span class="badge mute">关</span>'}</td>
