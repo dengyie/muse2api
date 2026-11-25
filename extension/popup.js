@@ -36,7 +36,7 @@ const I18N_EN = {
   '读取并导入': 'Read and import',
   // popup.js 日志 / 状态
   '请先填服务地址': 'Please enter the service URL first',
-  '请先填 API Key': 'Please enter the API Key first',
+  '请先填 API Key': 'Please enter the API Key or import token first',
   '正在读取 muse.ai 的 Cookie…': 'Reading muse.ai cookies…',
   '无法确认当前窗口的 Cookie 存储区。请在已登录 Muse 的窗口中打开扩展，并确认已允许扩展在无痕/InPrivate 模式运行。':
     'Cannot identify the current window\'s cookie store. Open the extension in the window signed in to Muse, and allow it in Incognito/InPrivate mode if needed.',
@@ -80,6 +80,8 @@ const I18N_EN_HTML = {
 /* 服务端返回的含变量文案：[正则, 替换串] */
 const I18N_EN_PATTERNS = [
   [/^缺少核心 cookie：(.*)，该账号可能无法生成$/s, 'Missing core cookies: $1; this account may not be able to generate'],
+  [/^密钥不对（服务返回 401）。[\s\S]*$/s, 'Wrong key or token (HTTP 401).\nIf you used an m2a_imp_ one-time import token: it expires after a successful import - generate a new one on the admin page.\nIf you used an API Key, copy the correct one from the top of the Account Pool page.'],
+  [/^这个 muse\.ai 号已经在账号池里了（服务返回 409），无需重复导入。$/s, 'This muse.ai account is already in the pool (HTTP 409); no need to import again.'],
 ];
 
 function t(s, vars) {
@@ -109,10 +111,21 @@ function applyLang() {
   });
 }
 
-function log(html, cls) {
+function log(text, cls) {
+  // patch22r：innerHTML → textContent + white-space——服务端响应原文
+  // （HTTP 错误 body 等）此前未转义直接拼 HTML，popup 运行在
+  // chrome-extension:// 特权上下文且 manifest 有全域 host_permissions
+  // + cookies 权限：http 配置下 MITM 注入即可读任意站点 cookie。
+  // 所有 log 调用方均为纯文本（\n 换行），textContent 语义等价且免疫注入。
   const el = $('log');
   el.className = 'show';
-  el.innerHTML = cls ? `<span class="${cls}">${html}</span>` : html;
+  el.style.whiteSpace = 'pre-wrap';
+  el.textContent = text;
+  if (cls) {
+    el.classList.add(cls);
+  } else {
+    el.classList.remove('bad', 'ok');
+  }
 }
 
 /* 规范化服务地址：去掉结尾斜杠和 /v1 后缀 */
@@ -206,6 +219,17 @@ async function run() {
 
     log(t('读到 {n} 条 Cookie，正在上传到 {base} …', { n: names.length, base }));
 
+    // patch22r：manifest 收窄后动态申请服务地址权限（MV3 optional_host_permissions；
+    // fetch 到未授权 origin 会被浏览器拦截）。run() 由导入按钮 click 触发，
+    // 满足权限申请的用户手势要求。
+    let granted = false;
+    try {
+      granted = await chrome.permissions.request({ origins: [base + '/'] });
+    } catch (e) { /* 不支持 permissions API 的环境按原样尝试 */ }
+    if (!granted && chrome.permissions?.contains) {
+      granted = await chrome.permissions.contains({ origins: [base + '/'] });
+    }
+
     const r = await fetch(base + '/admin/accounts', {
       method: 'POST',
       headers: {
@@ -220,8 +244,12 @@ async function run() {
     try { data = JSON.parse(text); } catch (e) { data = { raw: text }; }
 
     if (r.status === 401) {
-      return log(t('API Key 不对（服务返回 401）。\n'
-                 + '请到管理页「账号池」页顶部复制正确的 API Key。'), 'bad');
+      return log(t('密钥不对（服务返回 401）。\n'
+                 + '若填的是 m2a_imp_ 一次性导入令牌：令牌导入成功即失效，请回管理页重新生成；'
+                 + '若填的是 API Key，请到管理页「账号池」页顶部复制正确的 Key。'), 'bad');
+    }
+    if (r.status === 409) {
+      return log(t('这个 muse.ai 号已经在账号池里了（服务返回 409），无需重复导入。'), 'bad');
     }
     if (!r.ok) {
       const body = typeof data.detail === 'string' ? t(data.detail) : text.slice(0, 300);

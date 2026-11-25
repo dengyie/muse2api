@@ -7,7 +7,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MUSE2API_HOST=0.0.0.0 \
     MUSE2API_PORT=18610 \
     MUSE2API_CHROMIUM=/usr/bin/chromium \
-    MUSE2API_CDP_PORT=19210
+    MUSE2API_CDP_PORT=19210 \
+    # patch22r：镜像部署拒绝容器内 git 升级（/admin/update/now 整树覆盖
+    # 二开 = 2026-11-16 事故的显式按钮版，升级一律走 build + compose up）
+    MUSE2API_MANAGED_DEPLOYMENT=1
 
 # 上游 1.6.11：镜像构建溯源（合并 1.6.11 时并入）
 ARG BUILD_SHA=
@@ -36,8 +39,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 复制代码与必要目录（二开模块 tetherpool/mediabak + 上游新模块 generation_timing/thumbnails）
-COPY admin.html app.py cdp.py config.py engine.py store.py proxy.py tetherpool.py mediabak.py generation_timing.py thumbnails.py version.json ./
+# 复制代码与必要目录（二开模块 tetherpool/mediabak/idempotency + 上游新模块 generation_timing/thumbnails）
+COPY admin.html remote_login.html login_session.py app.py cdp.py config.py engine.py store.py proxy.py tetherpool.py mediabak.py idempotency.py updater.py generation_timing.py thumbnails.py version.json ./
 COPY deploy/ ./deploy/
 COPY extension/ ./extension/
 COPY tools/ ./tools/
@@ -48,5 +51,9 @@ RUN mkdir -p /app/data/media /app/data/downloads /root/muse2api-profiles
 VOLUME ["/app/data"]
 
 EXPOSE 18610
+
+# patch22r：镜像级健康检查（与 compose healthcheck 双保险）
+HEALTHCHECK --interval=60s --timeout=10s --start-period=90s --retries=3 \
+  CMD curl -sf http://127.0.0.1:18610/healthz || exit 1
 
 CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "18610"]

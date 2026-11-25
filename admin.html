@@ -380,7 +380,7 @@
           <button class="secondary" id="btnKeepaliveAll" onclick="keepaliveAll()" style="font-size:12px;padding:6px 14px">⚡ 一键保活所有账号</button>
         </div>
       </div>
-      <div class="hint" data-i18n="keepalive-hint">系统已开启<b>后台每 30 分钟静默保活</b>与<b>多账号公平轮转（LRU）</b>；「测试」会真实打开 muse.ai 验证会话。</div>
+      <div class="hint" data-i18n="keepalive-hint">系统已开启<b>后台每 15 分钟静默保活</b>（近 6h 内已保活且会话充足的账号自动跳过）与<b>多账号公平轮转（LRU）</b>；「测试」会真实打开 muse.ai 验证会话。</div>
       <div class="tblwrap"><table>
         <thead><tr>
           <th>标签</th><th>账号 ID</th><th>状态</th><th>有效期</th><th>额度</th><th data-i18n="col-enabled">启用</th><th>Cookie</th>
@@ -502,24 +502,44 @@
       </div>
 
       <div class="hint" style="margin-top:18px;padding-top:14px;border-top:1px solid var(--line)" data-i18n="cli-script-hint">
-        如果你习惯命令行、或者想用独立浏览器登录（不碰日常浏览器），也可以用这个脚本。
-        它只用 Python 标准库，<b>不需要 pip 安装任何东西</b>。
+        推荐：一键生成<b>一次性导入令牌</b>（15 分钟有效、单次成功即失效，不暴露完整密钥），
+        复制命令到本地运行 → 弹出独立浏览器窗口登录新 muse.ai 号 → 自动抓取并导入。
+        也可以下载脚本手动运行。脚本只用 Python 标准库，<b>不需要 pip 安装任何东西</b>。
       </div>
       <div class="row" style="margin-top:10px">
         <div style="flex:2">
-          <label>① 下载脚本</label>
-          <div class="copyline">
-            <a class="btnlike ghostlike" href="/admin/cookie-helper?download=1" download>⬇ get_muse_cookie.py</a>
-            <a class="btnlike ghostlike" href="/admin/cookie-helper" target="_blank">查看源码</a>
-          </div>
+          <label data-i18n="token-label-label">账号标签（可选）</label>
+          <input id="mImpLabel" placeholder="acc-02" style="width:100%">
         </div>
-        <div style="flex:4;min-width:0">
-          <label>② 运行（地址和密钥已帮你填好）</label>
-          <pre class="code" id="cmdBox"><span class="cp" onclick="copyCmd()">复制</span><span id="cmdText">正在生成命令…</span></pre>
+        <div style="flex:2">
+          <label>&nbsp;</label>
+          <button class="btnlike" onclick="genImportToken()" id="genTokBtn" data-i18n="gen-token-btn">🔐 生成一次性导入令牌</button>
         </div>
       </div>
-      <div class="hint" style="margin-top:8px">
-        ③ 在弹出的浏览器窗口里登录 muse.ai → 脚本自动抓取并上传 → 自动关窗。
+      <div style="margin-top:10px">
+        <label data-i18n="token-cmd-label">① 复制命令到本地运行（令牌已嵌入）</label>
+        <pre class="code" id="tokCmdBox" style="display:none"><span class="cp" onclick="copyText(document.getElementById('tokCmdText').textContent)">复制</span><span id="tokCmdText"></span></pre>
+      </div>
+      <div class="row" style="margin-top:14px;align-items:flex-end">
+        <div style="flex:2">
+          <label data-i18n="rl-url-label">③ 或远程浏览器导号：生成链接，对方打开直接在服务器浏览器里登录</label>
+          <div class="copyline">
+            <button class="btnlike" onclick="genLoginUrl()" id="genLoginUrlBtn">🖥 生成远程登录链接</button>
+          </div>
+        </div>
+      </div>
+      <pre class="code" id="rlUrlBox" style="display:none"><span class="cp" onclick="copyText(document.getElementById('rlUrlText').textContent)">复制</span><span id="rlUrlText"></span></pre>
+      <div class="row" style="margin-top:10px">
+        <div style="flex:2">
+          <label data-i18n="dl-script-label">② 或下载脚本手动运行</label>
+          <div class="copyline">
+            <a class="btnlike ghostlike" href="/admin/cookie-helper?download=1" download>⬇ get_muse_cookie.py</a>
+            <a class="btnlike ghostlike" href="/admin/cookie-helper" target="_blank" data-i18n="view-src">查看源码</a>
+          </div>
+        </div>
+      </div>
+      <div class="hint" style="margin-top:8px" data-i18n="token-flow-hint">
+        ③ 在弹出的浏览器窗口里登录 muse.ai → 脚本自动抓取并上传 → 自动关窗。同一账号重复导入会被拒绝。
       </div>
     </div>
 
@@ -1247,7 +1267,7 @@ const I18N_EN_HTML = {
   "auth-banner": "\n      <b>Enter your API Key first so the page can load data</b><br>\n      <span style=\"color:var(--muted)\">\n        The API Key is this service's own \"access password\". It stops other people from using your Muse account quota.\n        It is <b style=\"color:var(--text)\">not</b> your Muse password. It is a random string generated at deploy time (it starts with <code>m2a_</code>).<br>\n        Paste it into the box at the top right and click \"Save\". Your browser remembers it, so you won't need to enter it again.\n      </span>\n    ",
   "model-names-hint": "\n        Model names: <code>muse-spark</code> (chat/code), <code>muse-image</code> (images), <code>muse-video</code> (videos).\n        See the \"Integration Docs\" tab for full examples.\n      ",
   "add-account-hint": "\n        Copy the <b>muse.ai</b> cookie string from your browser and paste it here. Required cookies:\n        <code>hatch_sess</code>. <code>hatch_vml</code> is an optional workspace token and does not block import.\n        For batch import, put one account per line in the format <code>label | cookie string</code> (label is optional).\n      ",
-  "keepalive-hint": "The system runs <b>a silent background keep-alive every 30 minutes</b> and <b>fair multi-account rotation (LRU)</b>. \"Test\" actually opens muse.ai to verify the session.",
+  "keepalive-hint": "The system runs <b>a silent background keep-alive every 15 minutes</b> (accounts kept alive recently with sufficient session are skipped) and <b>fair multi-account rotation (LRU)</b>. \"Test\" actually opens muse.ai to verify the session.",
   "ext-why-hint": "\n        A small browser extension syncs <b>the muse.ai login you already have on your own computer</b>.\n        No Python, no terminal, no commands.<br>\n        <b>Why an extension is required</b>: muse.ai's login session cookie is marked\n        <code>httpOnly</code>, so page scripts (typing <code>document.cookie</code> in F12,\n        bookmarklets) can't read them. Only a browser extension's <code>cookies</code> API can.\n      ",
   "ext-unzip-hint": "\n            Unzip it to a folder you won't delete, e.g. <code>D:\\muse2api-extension</code>.\n          ",
   "ext-load-steps": "\n            <li>Type <code>chrome://extensions</code> in the address bar and press Enter</li>\n            <li>Turn on the <b>Developer mode</b> switch at the top right</li>\n            <li>Click <b>Load unpacked</b> at the top left</li>\n            <li>Select the <b>folder</b> you unzipped in step 1 (not a single file inside it)</li>\n          ",
@@ -1255,7 +1275,12 @@ const I18N_EN_HTML = {
   "manual-copy-hint": "\n        If you don't want to install the extension, you can copy the cookie string by hand. The key is to use\n        <b>the request headers in the \"Network\" panel</b>, not the Console: the request header's\n        <code>cookie:</code> line <b>includes the httpOnly cookies</b>, which the Console can't read.\n      ",
   "manual-copy-steps": "\n        <li>Open and log in to <code>https://muse.ai/</code> in your own browser and stay on the chat screen</li>\n        <li>Press <kbd>F12</kbd> to open developer tools and switch to the <b>Network</b> panel</li>\n        <li>Press <kbd>F5</kbd> to reload the page so the request list fills up</li>\n        <li>Click <b>any muse.ai request</b> in the list (the first one is fine)</li>\n        <li>On the right, find <b>Headers</b> → scroll down to <b>Request Headers</b></li>\n        <li>Find the line starting with <code>cookie:</code> and <b>copy the whole string after the colon</b>\n            (from <code>hatch_sess=</code> to the end of the line)</li>\n        <li>Paste it into the box under \"Option 3\" below and click Import</li>\n      ",
   "manual-copy-warn": "\n        Note: use the <code>cookie:</code> line in the <b>request headers</b>, not the \"response headers\".\n        The <code>set-cookie</code> in the response headers only has some of the cookies, so things will be missing.\n      ",
-  "cli-script-hint": "\n        If you prefer the command line, or want to log in with a separate browser (without touching your everyday browser), you can use this script.\n        It only uses the Python standard library and <b>needs nothing installed via pip</b>.\n      ",
+  "cli-script-hint": "\n        Recommended: click to generate a <b>one-time import token</b> (valid for 15 minutes, single-use, never exposes the full admin key),\n        copy the command and run it locally → a separate browser window pops up, log in with the new muse.ai account → cookies are captured and imported automatically.\n        You can also download the script and run it manually. It only uses the Python standard library and <b>needs nothing installed via pip</b>.\n      ",
+  "token-label-label": "Account label (optional)",
+  "gen-token-btn": "🔐 Generate one-time import token",
+  "token-cmd-label": "① Copy the command and run it locally (token embedded)",
+  "dl-script-label": "② Or download the script and run it manually",
+  "token-flow-hint": "③ Log in to muse.ai in the pop-up browser window → the script captures and uploads automatically → window closes. Duplicate imports of the same account are rejected.",
   "vml-role": "Optional workspace token; <b>not required for import</b>",
   "lifetime-hint": "Session validity is determined by upstream authentication. hatch_vml is an optional workspace token that may be absent or reissued; its absence or expiry alone does not prove the login is invalid. Test the account after import. Log in and import again when the upstream returns HTTP 401.",
   "docs-intro": "\n        The API follows the OpenAI style; downstream projects only need to change <code>base_url</code> and <code>api_key</code>.\n        <br>BASE URL: <code id=\"dBase\">—</code>\n      ",
@@ -1446,6 +1471,12 @@ if (LANG === 'en') {
 const $ = id => document.getElementById(id);
 const KEY_STORE = 'muse2api_key';
 let KEY = localStorage.getItem(KEY_STORE) || new URLSearchParams(location.search).get('key') || '';
+// patch22r：?key= 入口读入后立即清除 URL 参数——否则 key 持久留在浏览器
+// 历史/书签、宿主 nginx 与 uvicorn access log（query 全文落盘，违反 key
+// 不落盘红线）。localStorage 才是合法存放点。
+if (new URLSearchParams(location.search).has('key')) {
+  try { history.replaceState(null, '', location.pathname + location.hash); } catch (e) {}
+}
 $('key').value = KEY;
 $('dBase').textContent = location.origin + '/v1';
 
@@ -1596,8 +1627,46 @@ function renderKey(){
 function toggleKey(){ keyShown = !keyShown; renderKey(); }
 
 function buildCmd(baseUrl){
+  // patch23：默认命令改为占位提示——真实命令由「生成一次性导入令牌」给出
+  //（令牌嵌入），不再把完整管理 Key 拼进命令行。
   const root = (baseUrl || location.origin).replace(/\/v1\/?$/, '').replace(/\/+$/, '');
-  return `python get_muse_cookie.py --base ${root} --key ${realKey || '你的API_KEY'} --label muse-01`;
+  return `点上方「生成一次性导入令牌」获取命令（目标：${root}）`;
+}
+
+/* patch23：一键导号——生成一次性导入令牌并展示完整命令 */
+async function genImportToken(){
+  const btn = $('genTokBtn');
+  const label = ($('mImpLabel') && $('mImpLabel').value || '').trim();
+  btn.disabled = true; const old = btn.textContent; btn.textContent = '生成中…';
+  try{
+    const d = await api('/admin/import-token', {method:'POST', body: JSON.stringify({label})});
+    let cmd = d.command || '';
+    if (label && !/--label/.test(cmd)) cmd += ` --label ${label}`;
+    $('tokCmdText').textContent = cmd;
+    $('tokCmdBox').style.display = 'block';
+    toast(`令牌已生成，${Math.round((d.expires_in||900)/60)} 分钟内有效、单次成功即失效`, 'ok');
+  }catch(e){
+    toast('生成失败：' + (e.message || e), 'warn');
+  }finally{
+    btn.disabled = false; btn.textContent = old;
+  }
+}
+
+/* patch27：一键远程登录导号——生成登录链接（URL 即访问凭证，15min 单活跃） */
+async function genLoginUrl(){
+  const btn = $('genLoginUrlBtn');
+  const label = ($('mImpLabel') && $('mImpLabel').value || '').trim();
+  btn.disabled = true; const old = btn.textContent; btn.textContent = '生成中…';
+  try{
+    const d = await api('/admin/import-login-url', {method:'POST', body: JSON.stringify({label})});
+    $('rlUrlText').textContent = d.url || '';
+    $('rlUrlBox').style.display = 'block';
+    toast(`登录链接已生成，${Math.round((d.expires_in||900)/60)} 分钟内有效；发给对方打开即可，谁拿到链接谁可操作`, 'ok');
+  }catch(e){
+    toast('生成失败：' + (e.message || e), 'warn');
+  }finally{
+    btn.disabled = false; btn.textContent = old;
+  }
 }
 
 async function copyText(v){
@@ -1616,7 +1685,6 @@ async function copyText(v){
 }
 async function copyEl(id){ await copyText($(id).value); }
 async function copyKey(){ await copyText(realKey); }
-async function copyCmd(){ await copyText($('cmdText').textContent); }
 async function copyExKey(){ await copyText($('exKey').value); }
 
 /* 扩展方案：把 BASE URL / API Key 填进页面上的复制框 */
@@ -1779,14 +1847,14 @@ async function loadPool(){
         <td class="mono" title="${a.last_used ? fmtTime(a.last_used) : ''}">${ago(a.last_used)}</td>
         <td class="mono ellip" title="${esc(a.note||'')}">${esc(a.note || '—')}</td>
         <td><div class="acts">
-          <button class="ghost mini" onclick="testAcc('${a.id}')">测试</button>
-          <button class="ghost mini" onclick="keepaliveOne('${a.id}')" title="静默刷新会话令牌与有效期">保活</button>
-          <button class="ghost mini" onclick="queryQuota('${a.id}', this)">额度</button>
-          <button class="ghost mini" onclick="openProxy('${a.id}')">代理</button>
-          <button class="ghost mini" onclick="toggleAcc('${a.id}', ${!a.enabled})">${a.enabled ? '禁用' : '启用'}</button>
-          <button class="ghost mini" onclick="renameAcc('${a.id}','${esc(a.label)}')">改名</button>
-          <button class="ghost mini" onclick="updateCookies('${a.id}')">更新Cookie</button>
-          <button class="danger mini" onclick="delAcc('${a.id}','${esc(a.label)}')">删除</button>
+          <button class="ghost mini" data-act="test" data-id="${a.id}">测试</button>
+          <button class="ghost mini" data-act="keepalive" data-id="${a.id}" title="静默刷新会话令牌与有效期">保活</button>
+          <button class="ghost mini" data-act="quota" data-id="${a.id}">额度</button>
+          <button class="ghost mini" data-act="proxy" data-id="${a.id}">代理</button>
+          <button class="ghost mini" data-act="toggle" data-id="${a.id}" data-enabled="${a.enabled ? 1 : 0}">${a.enabled ? '禁用' : '启用'}</button>
+          <button class="ghost mini" data-act="rename" data-id="${a.id}" data-label="${esc(a.label)}">改名</button>
+          <button class="ghost mini" data-act="cookies" data-id="${a.id}">更新Cookie</button>
+          <button class="danger mini" data-act="del" data-id="${a.id}" data-label="${esc(a.label)}">删除</button>
         </div></td>
       </tr>`;
     }).join('');
@@ -1796,6 +1864,29 @@ async function loadPool(){
       : `<tr><td colspan="10" class="empty">加载失败：${esc(e.message)}</td></tr>`;
   }
 }
+
+/* patch22r：账号行按钮事件委托——onclick="fn('${esc(label)}')" 的 esc 只防
+   HTML 逃逸，HTML 属性解码后 `'` 会进入 JS 字符串上下文形成注入面（label
+   含 x'),alert(1),(' 即触发）。改 data-act/data-id/data-label 属性 +
+   addEventListener，dataset 值无 JS 上下文解码问题。 */
+(function bindPoolActions(){
+  const fnMap = {
+    test: (id) => testAcc(id),
+    keepalive: (id) => keepaliveOne(id),
+    quota: (id, btn) => queryQuota(id, btn),
+    proxy: (id) => openProxy(id),
+    toggle: (id, btn) => toggleAcc(id, btn.dataset.enabled !== '1'),
+    rename: (id, btn) => renameAcc(id, btn.dataset.label || ''),
+    cookies: (id) => updateCookies(id),
+    del: (id, btn) => delAcc(id, btn.dataset.label || ''),
+  };
+  document.addEventListener('click', (ev) => {
+    const btn = ev.target.closest('[data-act]');
+    if (!btn || !$('poolBody') || !$('poolBody').contains(btn)) return;
+    const fn = fnMap[btn.dataset.act];
+    if (fn) fn(btn.dataset.id, btn);
+  });
+})();
 
 async function addAccount(fromManual){
   const labelEl = $(fromManual ? 'mLabel' : 'newLabel');

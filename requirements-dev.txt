@@ -1,0 +1,4 @@
+# patch22r：测试依赖（requirements.txt 之外）。CI 与本地共用。
+-r requirements.txt
+httpx>=0.27,<1
+pytest>=8,<10

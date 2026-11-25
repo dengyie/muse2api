@@ -26,6 +26,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 from urllib.parse import quote
@@ -38,6 +39,7 @@ _UA = {"User-Agent": "Mozilla/5.0 (MangoDrive-consumer)"}
 _TOKEN_TTL = 48 * 3600
 _FAIL_BACKOFF_THRESHOLD = 5  # 连续 5 次才退避（生产实测 mesh 有单笔瞬时抖动，3 太敏感）
 _FAIL_BACKOFF_SECS = 1800
+_MESH_COOLDOWN_SECS = 1800   # patch22n：mesh login 连接类故障冷却（与备份退避同长）
 
 
 def _cfg() -> dict:
@@ -71,6 +73,10 @@ class MediaBackuper:
         self._chan: str | None = None      # 当前可用通道: "mesh" | "public"
         self._consecutive_fail = 0
         self._backoff_until = 0.0
+        # patch22r：交付回源独立退避（与备份扫描分离）
+        self._delivery_consecutive_fail = 0
+        self._delivery_backoff_until = 0.0
+        self._mesh_dead_until = 0.0        # patch22n：mesh 探测失败冷却（连不上的通道不再每轮先撞 15s）
 
     # ---- 通道与鉴权 ----
     def _base(self, chan: str) -> str:
@@ -84,10 +90,16 @@ class MediaBackuper:
                               headers=_UA, timeout=15)
             data = r.json()
             if data.get("code") == 200:
+                if chan == "mesh":
+                    self._mesh_dead_until = 0.0  # 恢复，解除冷却
                 return data["data"]["token"]
             log.warning("【媒体备份】%s login 失败: %s", chan, str(data.get("message"))[:100])
         except Exception as exc:  # noqa: BLE001
             log.warning("【媒体备份】%s login 异常: %s", chan, str(exc)[:100])
+            if chan == "mesh" and self._mesh_dead_until < time.monotonic():
+                # 连接类故障冷却 30 分钟（期间排到遍历队尾，不阻塞 public 主路）
+                self._mesh_dead_until = time.monotonic() + _MESH_COOLDOWN_SECS
+                log.info("【媒体备份】mesh 通道进入 %.0f 分钟冷却", _MESH_COOLDOWN_SECS // 60)
         return None
 
     def _get_token(self) -> tuple[str | None, str]:
@@ -99,8 +111,19 @@ class MediaBackuper:
             now = time.monotonic()
             if self._token and now - self._token_at < _TOKEN_TTL:
                 return self._token, self._chan
-            order = ([self._chan] if self._chan else []) + \
+            # patch22n：通道遍历顺序——冷却中的通道一律排到最后（含 _chan 本身：
+            # mesh 健康转故障时 _chan 仍是 mesh，若不降级每轮仍先撞 15s 超时）。
+            # 冷却 30 分钟后自动复探：mesh 排回最前（静态首选，恢复即回到主位）。
+            chans = ([self._chan] if self._chan else []) + \
                     [x for x in ("mesh", "public") if x != self._chan]
+            now_mono = time.monotonic()
+            mesh_dead = now_mono < self._mesh_dead_until
+            if mesh_dead:
+                alive = [c for c in chans if c != "mesh"]
+                order = alive + ["mesh"]
+            else:
+                alive = [c for c in chans if c != "mesh"]
+                order = ["mesh"] + alive
             for chan in order:
                 tok = self._login(chan)
                 if tok:
@@ -213,6 +236,81 @@ class MediaBackuper:
         except Exception:  # noqa: BLE001
             return None
 
+    def fetch_remote(self, name: str) -> bytes | None:
+        """patch22k：按名回源已备份媒体（交付链兜底）。
+
+        delete_local=True 时本地副本会在备份校验通过后被删除，此后
+        /v1/media/{name} 与 /v1/videos/{id}/content 必须回源 OpenList 取回，
+        否则任务记录里 url 指向的成品从此不可读（交付断链）。
+        patch22m：不再用固定 7 天窗口——备份目录按日期组织且远端不清理，
+        任务 url 是永久引用，窗口外的历史成品同样必须可回源。改为 fs/list
+        枚举 base 下全部日期目录、名称倒序（新→旧）逐日 fs/get。
+        失败计入既有 _note_fail 退避（与 scan_once 共享），通道故障时
+        后续请求快速返回 None，不为每次交付重付超时。
+        """
+        if not enabled() or not name or "/" in name or "\\" in name or ".." in name:
+            return None
+        if self.delivery_in_backoff():
+            log.warning("【媒体回源】备份通道退避中，跳过回源 %s", name)
+            return None
+        tok, chan = self._get_token()
+        if not tok:
+            self._note_delivery_fail()
+            return None
+        base = _cfg()["base"]
+        try:
+            r = requests.post(self._base(chan) + "/api/fs/list",
+                              json={"path": base, "page": 1, "per_page": 0},
+                              headers={**_UA, "Authorization": tok}, timeout=20)
+            data = r.json()
+        except Exception as exc:
+            log.warning("【媒体回源】列目录失败: %s", str(exc)[:100])
+            self._note_delivery_fail()
+            return None
+        if data.get("code") in (401, 403):
+            self._invalidate_token()
+            return None
+        if data.get("code") != 200:
+            self._note_delivery_fail()
+            return None
+        days = sorted(((c.get("name") or "") for c in (data.get("data") or {}).get("content") or []),
+                      reverse=True)
+        for day in days:
+            if not re.match(r"^\d{4}-\d{2}-\d{2}$", day):
+                continue  # 只认日期目录（.gitkeep 等杂物跳过）
+            try:
+                r = requests.post(self._base(chan) + "/api/fs/get",
+                                  json={"path": f"{base}/{day}/{name}"},
+                                  headers={**_UA, "Authorization": tok}, timeout=20)
+                data = r.json()
+            except Exception:
+                continue
+            if data.get("code") in (401, 403):
+                self._invalidate_token()
+                return None
+            if data.get("code") != 200:
+                continue
+            raw_url = (data.get("data") or {}).get("raw_url") or ""
+            if not raw_url:
+                continue
+            try:
+                # patch22r：超时按体积伸缩（原固定 120s，大视频慢通道必 503）；
+                # 对齐 _put/_remote_sha 的 size // (512KB) 公式，60s 下限
+                dl_size = (data.get("data") or {}).get("size") or 0
+                dl_timeout = max(60, int(dl_size) // (512 * 1024)) if dl_size else 300
+                rr = requests.get(raw_url, headers=_UA, timeout=dl_timeout)
+            except Exception as exc:
+                log.warning("【媒体回源】raw 下载失败 %s/%s: %s", day, name, str(exc)[:80])
+                self._note_delivery_fail()
+                return None
+            if rr.status_code == 200 and rr.content:
+                self._note_ok()
+                self._note_delivery_ok()  # patch22r-review：成功即复位交付退避
+                return rr.content
+            self._note_delivery_fail()
+            return None
+        return None
+
     def _remove_remote(self, tok: str, chan: str, dir_path: str, names: list[str]) -> bool:
         try:
             r = requests.post(self._base(chan) + "/api/fs/remove",
@@ -301,6 +399,29 @@ class MediaBackuper:
                 self._backoff_until = time.monotonic() + _FAIL_BACKOFF_SECS
                 log.warning("【媒体备份】连续失败 %d 次，退避 %d 分钟（本地文件保留）",
                             self._consecutive_fail, _FAIL_BACKOFF_SECS // 60)
+
+    def _note_delivery_fail(self):
+        """patch22r：交付回源独立退避计数——原实现与备份扫描共享 _note_fail，
+        交付突发失败（网络抖动）会连坐停摆备份 30 分钟（成品 url 变 30 分钟
+        不可读 + 新成品不备份）。两个面分开计数互不传染。"""
+        with self._lock:
+            self._delivery_consecutive_fail += 1
+            if self._delivery_consecutive_fail >= _FAIL_BACKOFF_THRESHOLD:
+                self._delivery_backoff_until = time.monotonic() + _FAIL_BACKOFF_SECS
+                log.warning("【媒体回源】连续失败 %d 次，回源退避 %d 分钟（备份扫描不受影响）",
+                            self._delivery_consecutive_fail, _FAIL_BACKOFF_SECS // 60)
+
+    def _note_delivery_ok(self):
+        """patch22r-review：回源成功即复位交付退避——缺此复位时退避只能被
+        时间解除，网络恢复后 30 分钟内的所有回源仍被入口拒绝（成 404 快速
+        路径），成品「永久引用」变成无谓的不可读窗口。"""
+        with self._lock:
+            self._delivery_consecutive_fail = 0
+            self._delivery_backoff_until = 0.0
+
+    def delivery_in_backoff(self) -> bool:
+        with self._lock:
+            return time.monotonic() < self._delivery_backoff_until
 
     def in_backoff(self) -> bool:
         with self._lock:

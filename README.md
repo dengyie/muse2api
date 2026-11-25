@@ -82,7 +82,7 @@ Extension 1.0.3 requires a manual reload in every browser profile. Update checks
   - 基于 Chromium 原生 `Target.createBrowserContext` 隐身隔离容器，多任务在独立沙箱中并发执行。
   - 多账号同时生图、生视频、流式对话零互相阻塞，Cookie 与 Session 100% 隔离绝不串扰。
   - 内置智能账号冲突调度器，同账号自动互斥防踩踏，多账号自动并行跑满。
-  - 可通过 `MUSE2API_CONCURRENCY` 随机器性能灵活调大并发上限（默认 2 并发）。
+  - 可通过 `MUSE2API_CONCURRENCY` 随机器性能灵活调大并发上限（默认 8 并发）。
 - 🔄 **多账号池与热连接亲和调度**
   - 支持导入无上限的 Muse 账号矩阵。
   - 基于热连接亲和（Warm-Tab Affinity）与 LRU 策略智能分发，兼顾 2 秒级极速响应与多号均衡消耗。
@@ -421,7 +421,7 @@ Nginx 反代需把 `client_max_body_size` 调到 200M 左右，否则大素材�
 | `MUSE2API_PUBLIC_BASE` | `空` | 对外完整 URL 前缀，留空时前端自动识别访问来源 |
 | `MUSE2API_CHROMIUM` | `chromium` | 浏览器可执行程序完整路径 |
 | `MUSE2API_CDP_PORT` | `19210` | 内部 CDP 调试通信端口 |
-| `MUSE2API_CONCURRENCY` | `2` | 最大并发生成任务数（支持随服务器资源自由调高，默认 2） |
+| `MUSE2API_CONCURRENCY` | `8` | 最大并发生成任务数（支持随服务器资源自由调高，默认 8） |
 | `MUSE2API_IMAGE_TIMEOUT` | `240` | 生图超时上限（秒） |
 | `MUSE2API_VIDEO_TIMEOUT` | `600` | 生视频超时上限（秒） |
 | `MUSE2API_CHAT_TIMEOUT` | `300` | 对话生成超时上限（秒） |

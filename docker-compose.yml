@@ -2,18 +2,28 @@ version: '3.8'
 
 services:
   muse2api:
-    build: .
+    build:
+      context: .
+      # patch22r-review：防御位——`docker compose build` 不带 --build-arg 时
+      # 镜像仍带可辨识 SHA（正式溯源走部署 SOP 的 CLI build --build-arg）。
+      args:
+        # patch25：引用式——部署 SOP 用 .env 或环境变量注入真值 SHA，
+        # 未注入时防御位回落 "dev"（可辨识非正式构建）。
+        BUILD_SHA: "${MUSE2API_BUILD_SHA:-dev}"
     image: muse2api:tp
     container_name: muse2api
     restart: always
     ports:
       - "127.0.0.1:18610:18610"
     environment:
-      # 管理与 API 鉴权 Key（从 .env 或宿主环境读取，留空则自动生成）
+      # 管理与 API 鉴权 Key（从 .env 或宿主环境读取，留空则自动生成并写入
+      # data/runtime.env——容器重建后 rotate 过的 key 不再回滚）
       - MUSE2API_KEY=${MUSE2API_KEY:-}
       # 服务对外基准 URL，如 https://your-domain.com（留空则管理前端自动检测当前域名）
-      - MUSE2API_PUBLIC_BASE=
-      # 超时配置（秒）
+      # patch27b：改引用式——原硬编码空值会静默覆盖宿主 .env，导入令牌/登录
+      # 链接的 base 回落 127.0.0.1，其他设备打不开（2026-11-23 实弹实证）
+      - MUSE2API_PUBLIC_BASE=${MUSE2API_PUBLIC_BASE:-}
+      # 超时配置（秒）——与 config.py 默认值一致，仅作显式化
       - MUSE2API_IMAGE_TIMEOUT=240
       - MUSE2API_VIDEO_TIMEOUT=600
       - MUSE2API_CHAT_TIMEOUT=300
@@ -22,11 +32,48 @@ services:
       # 生产在此前宿主 .env 显式设置这两个值（公开模板默认回环占位）
       - MUSE2API_TETHERPOOL_URL=${MUSE2API_TETHERPOOL_URL:-http://127.0.0.1:9100}
       - MUSE2API_TETHERPOOL_GATEWAY=${MUSE2API_TETHERPOOL_GATEWAY:-http://127.0.0.1:9101}
-      - MUSE2API_TASKS_MAX=${MUSE2API_TASKS_MAX:-120}
+      # patch22r：控制面服务 token 化后必须显式传递（此前默认密码被 11-18
+      # IP-Pool 改造除名，容器重建后心跳 acquire 401 绑定悬空）
+      - MUSE2API_TETHERPOOL_PASSWORD=${MUSE2API_TETHERPOOL_PASSWORD:-}
+      # patch22r：网关 9101 共享密码（GATEWAY_PASSWORD，11-18 改造后与服务
+      # token 不同值；缺省回落 TETHERPOOL_PASSWORD 兼容旧部署）
+      - MUSE2API_TETHERPOOL_GATEWAY_PASSWORD=${MUSE2API_TETHERPOOL_GATEWAY_PASSWORD:-}
+      # ---- 任务保留（patch22o/22r：与 config.py 默认值对齐，防配置漂移）----
+      # 历史教训：此处曾是 :-120，压测日 93 笔/天一天挤爆、11-15 档案全灭
+      # （OpenPet 409 取证断链根因）；patch22o 只改了服务器未回写仓库，
+      # 22r 补上回写。
+      - MUSE2API_TASKS_MAX=${MUSE2API_TASKS_MAX:-2000}
+      - MUSE2API_TASKS_KEEP_DAYS=${MUSE2API_TASKS_KEEP_DAYS:-30}
+      - MUSE2API_ARCHIVE_INDEX_MAX=${MUSE2API_ARCHIVE_INDEX_MAX:-50000}
       - MUSE2API_MEDIA_RETENTION_HOURS=${MUSE2API_MEDIA_RETENTION_HOURS:-0}
       - MUSE2API_BACKUP_ENABLED=${MUSE2API_BACKUP_ENABLED:-0}
       - MUSE2API_BACKUP_APP_PASS=${MUSE2API_BACKUP_APP_PASS:-}
+      # patch25: mesh 通道指向 mesh 内 OpenList 真身（引用式，.env 可覆盖）
+      - MUSE2API_BACKUP_MESH_URL=${MUSE2API_BACKUP_MESH_URL:-http://127.0.0.1:5244}
     volumes:
       # 持久化账号配置、任务日志及媒体文件
       - ./data:/app/data
+    # patch22s-final：日志轮转（默认 json-file 无上限——40G 磁盘 65% 已用的
+    # 共享宿主上日志无界增长是经典故障源；且 22s 取证时发现历史容器日志随
+    # docker rm 丢失，50m×3 既保留 ~2 周取证窗口又封顶磁盘占用）
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     shm_size: '2gb' # 保证 Chromium 渲染多标签页时不因 /dev/shm 耗尽崩溃
+    # patch22r：资源上限（4C4G 共享宿主，Chromium/ffmpeg 尖峰无界会拖垮
+    # 同宿主服务且 OOM killer 命中对象不可控）。
+    # ⚠️ 权衡记录：2500m × MUSE2API_CONCURRENCY=8 满并发理论上可自 OOM
+    # （容器 restart 自愈，优于拖垮宿主其它服务）——扩号池/调大并发时
+    # 按每 context ~200MB 复核此值。
+    mem_limit: 2500m
+    memswap_limit: 2500m
+    # patch22r：健康检查（配合 restart: always 具备僵死探测——线程死锁类
+    # 故障进程不退出，原配置 restart 永不触发）
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:18610/healthz"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 90s

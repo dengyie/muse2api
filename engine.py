@@ -477,19 +477,31 @@ class MuseEngine:
         实证两个残留目录）。__init__ 时集合必为空，凡已存在的 context-*
         目录都是上一次进程的遗产，全部清掉；若目录里有未备份的媒体残留，
         mediabak 只扫 media_dir，不受影响。
+        patch22r：顺带清扫 muse2api-refs-* 附件上传临时目录——崩溃时来不及
+        删，残留即用户参考素材副本落盘（磁盘 + 隐私）。
         """
         try:
             d = getattr(self.cfg, "download_dir", None)
-            if not d or not os.path.isdir(d):
-                return
-            removed = 0
-            for name in os.listdir(d):
-                if name.startswith("context-"):
-                    shutil.rmtree(os.path.join(d, name), ignore_errors=True)
-                    removed += 1
-            if removed:
-                logging.getLogger("muse2api.engine").info(
-                    "patch25: 清扫上次运行遗留孤儿下载目录 %d 个", removed)
+            if d and os.path.isdir(d):
+                removed = 0
+                for name in os.listdir(d):
+                    if name.startswith("context-"):
+                        shutil.rmtree(os.path.join(d, name), ignore_errors=True)
+                        removed += 1
+                if removed:
+                    logging.getLogger("muse2api.engine").info(
+                        "patch25: 清扫上次运行遗留孤儿下载目录 %d 个", removed)
+            # patch22r：附件上传临时目录（同上遗产语义，全清安全）
+            pd = getattr(self.cfg, "profile_dir", None)
+            if pd and os.path.isdir(pd):
+                removed = 0
+                for name in os.listdir(pd):
+                    if name.startswith("muse2api-refs-"):
+                        shutil.rmtree(os.path.join(pd, name), ignore_errors=True)
+                        removed += 1
+                if removed:
+                    logging.getLogger("muse2api.engine").info(
+                        "patch22r: 清扫上次运行遗留附件上传临时目录 %d 个", removed)
         except OSError:
             pass
 
@@ -531,7 +543,33 @@ class MuseEngine:
     def start(self):
         with self._start_lock:
             if self.proc and self.proc.poll() is None and self.browser:
-                return
+                # patch22r：早退前廉价探活——原实现只看「进程活 + 有 browser
+                # 对象」，browser 级 CDP websocket 断链（长会话/资源紧张时发生）
+                # 后每个任务在 _open_page 失败且被误分类为 MuseProxyError，15
+                # 分钟一次的预热同样被此早退短路，唯一恢复手段是容器重启。
+                # 探活失败 → 关闭死连接置 None，走下方正常重启分支自愈。
+                try:
+                    http_json(self._debug_url(), timeout=3)
+                except Exception:
+                    log.warning("【浏览器】CDP 端点探活失败（进程存活但连接已死），重建 browser 连接")
+                    try:
+                        self.browser.close()
+                    except Exception:
+                        pass
+                    self.browser = None
+                    # patch22r-review：旧 chromium 的 CDP 端口/user-data-dir 锁
+                    # 已不可信——不终止就继续会 Popen 第二个实例（端口占用 +
+                    # 锁竞争 + 旧进程泄漏），且对存活进程删 SingletonLock 本身
+                    # 有害。先 terminate 置 None，下方按全新启动语义走。
+                    if self.proc and self.proc.poll() is None:
+                        self.proc.terminate()
+                        try:
+                            self.proc.wait(timeout=10)
+                        except Exception:  # noqa: BLE001
+                            self.proc.kill()
+                    self.proc = None
+                else:
+                    return
             env = dict(os.environ)
             env.setdefault("HOME", self.cfg.home_dir)
             env["PATH"] = (self.cfg.extra_path + os.pathsep + env.get("PATH", "")) if self.cfg.extra_path else env.get("PATH", "")
@@ -567,6 +605,12 @@ class MuseEngine:
                         pass
 
             os.makedirs(self.cfg.data_dir, exist_ok=True)
+            # patch22r：重启分支先关旧日志句柄（start/stop 循环句柄泄漏）
+            try:
+                if getattr(self, "_log", None) and not self._log.closed:
+                    self._log.close()
+            except Exception:
+                pass
             self._log = open(os.path.join(self.cfg.data_dir, "chromium.log"), "ab", buffering=0)
             cwd_dir = self.cfg.home_dir if (self.cfg.home_dir and os.path.isdir(self.cfg.home_dir)) else None
             self.proc = subprocess.Popen(args, stdout=self._log, stderr=subprocess.STDOUT,
@@ -605,6 +649,12 @@ class MuseEngine:
                 except Exception:  # noqa: BLE001
                     self.proc.kill()
             self.proc = None
+            # patch22r：stop 收尾关 chromium.log 句柄（start/stop 循环泄漏）
+            try:
+                if getattr(self, "_log", None) and not self._log.closed:
+                    self._log.close()
+            except Exception:
+                pass
             with self._contexts_lock:
                 relays = list(self._proxy_relays)
                 self._proxy_relays.clear()
@@ -673,6 +723,16 @@ class MuseEngine:
         """
         if not fp:
             return
+        # patch22i 防御层：muse.ai composer 在非英语 Accept-Language 下附件
+        # 处理树不挂载（容器内对照：de-DE → attach 0/1 form_len=0；en-US → OK）。
+        # 语言维度强制英语系——存量非英语档案（de-DE 等）即时生效，无需改库；
+        # 时区/屏幕/硬件等其它指纹维度不受影响。
+        _lang = str(fp.get("accept_language") or "")
+        if not _lang.lower().startswith("en"):
+            fp = dict(fp, accept_language="en-US",
+                      locale=str(fp.get("locale") or "") if str(
+                          fp.get("locale") or "").lower().startswith("en")
+                      else "en-US")
         try:
             # 完整 client hints（高熵位），Chrome 130-135 报法
             platform = fp.get("platform") or "Windows"
@@ -972,15 +1032,29 @@ class MuseEngine:
         return out
 
     def _wait_ws_ready(self, page: CDP, timeout: float = 15.0) -> bool:
-        """等待 muse.ai 页面完成 React hydration 且不再处于 Connecting... 状态。"""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+        """等待 muse.ai 页面完成 React hydration 且不再处于 Connecting... 状态。
+
+        patch22e：readyState 接受 interactive——线上实证（tencent-lh WARP 出口，
+        2026-11-17 probe）主文档可长期停在 interactive（慢子资源拖住 load 事件），
+        而 textarea 已渲染、hydration=hydrated、无 Connecting...，页面功能完全
+        就绪；坚持 'complete' 会把可用页面误判为超时（page_prep_timeout 假阳性，
+        即 OpenPet 两笔历史失败的直接根因之一）。可交互判定以 textarea+hydration
+        +无 Connecting... 为准，比文档加载事件更贴近真实可用性。
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             try:
                 st = page.js("""(function(){
-                    if (document.readyState !== 'complete') return 'loading';
+                    var rs = document.readyState;
+                    if (rs !== 'complete' && rs !== 'interactive') return 'loading';
                     if (!document.querySelector('textarea')) return 'no-ta';
                     var h = document.querySelector('[data-hatch-shell-hydration-state]');
-                    if (h && h.getAttribute('data-hatch-shell-hydration-state') !== 'hydrated') return 'hydrating';
+                    // patch22h：fail-closed——标记元素不存在 = React 尚未挂载
+                    // hydration 状态节点，事件委托同样未就绪（线上实证半加载页
+                    // 此处 h 为 null 被旧逻辑静默放过 → setFileInputFiles 的
+                    // change 事件无人处理 → 附件永不渲染）。必须有标记且已 hydrated。
+                    if (!h) return 'hydrating';
+                    if (h.getAttribute('data-hatch-shell-hydration-state') !== 'hydrated') return 'hydrating';
                     var b = document.body ? (document.body.innerText || '') : '';
                     if (b.indexOf('Connecting...') !== -1) return 'connecting';
                     // Empty composers may not render Send until text has been entered.
@@ -1022,8 +1096,8 @@ class MuseEngine:
             })(%s)""" % ("true" if for_chat else "false"))
             if needs_nav:
                 self.page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
-                t_end = time.time() + 10.0
-                while time.time() < t_end:
+                t_end = time.monotonic() + 10.0
+                while time.monotonic() < t_end:
                     time.sleep(0.08)
                     ready = self.page.js("""(function(){
                         return document.readyState === 'complete'
@@ -1150,9 +1224,11 @@ class MuseEngine:
             raise MuseAuthError("会话已被 muse.ai 登出（可能被其它登录挤掉或触发风控），"
                                 "请用浏览器扩展重新导入 cookie；未提交任何生成请求")
         # patch22：带证据的超时分类——不是账号失效，也不是会话失效。
+        # patch22e：ready 只把「非 complete 且非 interactive」算未加载——
+        # interactive+textarea+hydrated 是功能就绪页，不会走到这里。
         hint = []
-        if not d.get("ready") or d.get("ready") != "complete":
-            hint.append("主文档未完成加载")
+        if d.get("ready") not in ("complete", "interactive"):
+            hint.append("主文档未完成加载(%s)" % (d.get("ready") or "?"))
         if not d.get("ta"):
             hint.append("输入框未渲染")
         if d.get("hydration") and d.get("hydration") != "hydrated":
@@ -1257,14 +1333,17 @@ class MuseEngine:
             self.ensure_page(cookies, expires, account_id=account_id)
             self._quota_click(self._QUOTA_SETTINGS_JS, '找不到设置入口（Settings／設定／设置）')
             self._quota_click(self._QUOTA_MENU_JS, '设置菜单未出现可识别的设置项')
-            deadline = time.monotonic() + 12.0
+            # 2026-11 上游改版后 Settings 面板改为慢速懒加载：Usage 区先渲染
+            # 骨架屏（data-slot=skeleton），约 20-25s 才填入数据。等待窗口放宽
+            # 到 45s，并在骨架屏数量止跌回升前持续轮询（数据到位即提前返回）。
+            deadline = time.monotonic() + 45.0
             while True:
                 parsed = self._parse_quota(self.page.js(self._QUOTA_DIALOG_JS) or '')
                 if parsed['found']:
                     return parsed
                 if time.monotonic() >= deadline:
                     raise MuseGenerationError('额度面板未读到有效用量；旧缓存未覆盖')
-                time.sleep(0.2)
+                time.sleep(0.5)
         finally:
             self._close_page()
 
@@ -1364,11 +1443,18 @@ class MuseEngine:
         "})()"
     )
 
+    # patch33：附件读失败计数（连续 CDP 异常时 L3 不得据此判死）。
+    att_read_fail_streak = 0
+
     def attachments(self) -> list[dict]:
         try:
             raw = self.page.js(self._ATT_JS)
-            return json.loads(raw) if raw else []
+            data = json.loads(raw) if raw else []
+            MuseEngine.att_read_fail_streak = 0
+            return data
         except Exception:  # noqa: BLE001
+            # patch33：不再静默——递增类级连败计数，wait 循环消费。
+            MuseEngine.att_read_fail_streak += 1
             return []
 
     # ---------------- 发送 ----------------
@@ -1472,8 +1558,8 @@ class MuseEngine:
 
         # 等待发送按钮就绪并点击
         clicked = "no-button"
-        t_deadline = time.time() + 3.0
-        while time.time() < t_deadline:
+        t_deadline = time.monotonic() + 3.0
+        while time.monotonic() < t_deadline:
             res = self._click_send()
             if res == "clicked":
                 clicked = "clicked"
@@ -1553,8 +1639,8 @@ class MuseEngine:
                          base_att_cnt: int = 0, stop_event=None, baseline_sources=None,
                          has_upload: bool = False, base_user_cnt: int = 0) -> dict | None:
         baseline_sources = set(baseline_sources or ()) | {baseline_src}
-        deadline = time.time() + timeout
-        t_start = time.time()
+        deadline = time.monotonic() + timeout
+        t_start = time.monotonic()
         stable_src, stable_n = "", 0
         last_txt, txt_stable = "", 0
         refusal_last, refusal_stable = "", 0
@@ -1568,10 +1654,14 @@ class MuseEngine:
         # att_ever_grew = presentation 附件曾挂载过（上游处理附件的痕迹）。
         user_bubble_seen = False
         att_ever_grew = False
+        # patch33：L3 宽限判定状态——气泡出现后的空读轮数与附件读失败轮数。
+        l3_empty_streak = 0
+        att_fail_streak = 0
+        page_poll_fails = 0  # patch22r：页面死检测连续失败计数
         # patch12：base_user_cnt 由调用方在 _send 之前采集传入（patch11 在此
         # 采集太晚——气泡可能在 send 与 wait 进入之间已渲染，基线被污染，
         # 收据永远判不出 → L2 误判已送达消息并重复提交）。
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             if stop_event is not None and stop_event.is_set():
                 raise MuseGenerationError("客户端已断开连接，终止生成任务")
             time.sleep(0.6)
@@ -1585,8 +1675,18 @@ class MuseEngine:
                 cur_user = self._user_count()
                 if cur_user > base_user_cnt:
                     user_bubble_seen = True
-            if len(atts) > base_att_cnt:
-                att_ever_grew = True
+            # patch33：附件读失败（CDP 异常）轮不计入 L3 证据——空列表可能
+            # 是读失败伪造的；读成功轮清零连败计数。
+            att_read_ok = MuseEngine.att_read_fail_streak == 0
+            if att_read_ok:
+                att_fail_streak = 0
+                if len(atts) > base_att_cnt:
+                    att_ever_grew = True
+                    l3_empty_streak = 0
+                else:
+                    l3_empty_streak += 1
+            else:
+                att_fail_streak += 1
             # 严格按期望类型挑选附件，绝不接受跨模态兜底（如将视频请求降级为图片封面）
             matching_atts = []
             for a in atts:
@@ -1631,7 +1731,7 @@ class MuseEngine:
                         stable_src, stable_n = check_src, 0
                     if stable_n >= 1:
                         return att
-            elapsed = time.time() - t_start
+            elapsed = time.monotonic() - t_start
             cur_cnt = base_agent_cnt
             cur_txt = ""
             has_stop = False
@@ -1649,8 +1749,18 @@ class MuseEngine:
                         path: location.pathname || '', href: location.href || ''});
                 })()""")
                 st = json.loads(st_raw) if st_raw else {}
+                page_poll_fails = 0  # patch22r：成功即清零
             except Exception:
                 st = {}
+                # patch22r：页面死检测——原实现所有 CDP 异常静默吞掉按「计数 0」
+                # 处理，页面 crash/target 被杀/浏览器假死时会静默空转到总超时，
+                # 且无附件任务终态判 retryable=False 不切号（一次 crash 判死整个
+                # 任务）。连续失败（~30s）快速失败为可换号错误。
+                page_poll_fails += 1
+                if page_poll_fails >= 10:
+                    raise MuseGenerationError(
+                        "生成页面失去响应（CDP 连续读失败），已提前终止以释放账号",
+                        code="page_lost", stage="wait", retryable=True)
             tail = st.get("tail") or ""
             cur_cnt = int(st.get("cnt") or 0)
             cur_txt = st.get("txt") or ""
@@ -1659,7 +1769,7 @@ class MuseEngine:
             seen_stop = seen_stop or has_stop
             state = (cur_cnt, cur_txt, len(atts), has_stop, path)
             if previous_state is None or state != previous_state:
-                last_activity = time.time()
+                last_activity = time.monotonic()
                 previous_state = state
 
             if on_progress:
@@ -1708,11 +1818,31 @@ class MuseEngine:
                         raise MuseGenerationError(
                             "带图消息提交状态未知（输入框已空但用户气泡未出现 45s），换号重试")
                 elif not att_ever_grew:
-                    # L3 真附件层失效：上游收了消息，但 presentation 附件从未挂载
-                    # （附件没进对话上下文）。改 prompt 修不了，快速失败不烧重试链。
-                    raise MuseModelRefusalError(
-                        "上游附件失效：消息已送达（用户气泡出现）但 25 秒内附件从未进入生成上下文",
-                        code="upstream_attachment_broken")
+                    # patch33 前的 L3：气泡一出现 25s 未见 presentation 即判死。
+                    # 生产实锤误杀（task_61f5980f/task_6a0e758e）：attachments()
+                    # CDP 瞬时异常静默回 [] 或上游慢启动 >25s 时，「从未观察到」
+                    # 被当成「从未发生」。修复后三层防线：
+                    #   ① 读失败轮不累计空读证据（att_read_ok 门）；
+                    #   ② 宽限期 25s→45s 且要求空读稳定（45s 窗口内有效空读
+                    #      ≥40 轮才判死，正常轮 0.6s/轮≈66 轮）；
+                    #   ③ 判死前强取证：滚动+重读一次，读到增长即撤销。
+                    if att_fail_streak >= 3:
+                        pass  # 附件读连续失败：证据不足，不判死，交 deadline 兜底
+                    elif elapsed > 45.0 and l3_empty_streak >= 40:
+                        try:
+                            self._scroll_bottom()
+                            recheck = self.attachments()
+                            if len(recheck) > base_att_cnt:
+                                att_ever_grew = True  # 强取证翻案，回到 L1
+                                l3_empty_streak = 0
+                            else:
+                                raise MuseModelRefusalError(
+                                    "上游附件失效：消息已送达（用户气泡出现）但 45 秒内附件从未进入生成上下文（patch33 强取证复核确认）",
+                                    code="upstream_attachment_broken")
+                        except MuseModelRefusalError:
+                            raise
+                        except Exception:
+                            pass  # 复核读失败：证据不足，继续等待
                 # L1：user_bubble_seen 且 att_ever_grew（或曾增长）→ 上游正常处理中，
                 # 静默慢启动不设限，交由外层 deadline 兜底。
 
@@ -1771,7 +1901,7 @@ class MuseEngine:
             if (expect == "video" and seen_stop and not has_stop
                     and path.rstrip("/").endswith("/thread/new")
                     and cur_cnt <= base_agent_cnt and len(atts) <= base_att_cnt
-                    and elapsed >= 180.0 and time.time() - last_activity >= 90.0):
+                    and elapsed >= 180.0 and time.monotonic() - last_activity >= 90.0):
                 raise MuseGenerationError(
                     "Muse 未建立视频任务线程，页面在提交结束后持续无响应（已提前停止等待）")
         return None
@@ -1799,6 +1929,17 @@ class MuseEngine:
         return bool(re.search(
             r"\.(?:webp|png|jpe?g|mp4|webm)|imagine_media|deliverable|"
             r"generated\s+.*image|verified\s+generated|artifact|"
+            # patch22j：muse 视频 I2V 的实测成功声明报法——模型先输出参数
+            # 验证报告（"Verified: 6.00 seconds, 144 frames, 24fps, 1248x704,
+            # native I2V only..."），媒体随后才渲染/挂载。task_2e001214291342ea911e
+            # 实证：此文本 75s 稳定即被 txt_stable 误判「仅文本无媒体」提前终止
+            # （实际视频仍在产出）。此类带参数的 Verified 报告必须当作进行中信号。
+            # patch22m：收紧——评审指出裸 "\d+\s*fps" / "\d+\s*frames"
+            # 会把任何提到帧率/帧数的拒绝或闲聊文本也当作进行中，失败延迟退化
+            # 到 600s 满额。改为组合锚定：Verified: 开头带时长序列，或
+            # frames+fps 共现，或 Verified 行内含 seconds+frames/fps。
+            r"^Verified?:\s*\d+\.\d+\s*seconds\b|"
+            r"\b[0-9]+\s*frames?[^.\n]{0,24}[0-9]+\s*fps\b|"
             r"^(?:已(?:经)?(?:成功)?生成|生成好了|生成完毕|已完成|做好了)(?:[，。！\s]|$)|"
             r"(?:视频|影片|短片|图片|图像)[^。！？!?\n]{0,40}"
             r"(?:已(?:经)?(?:成功)?生成|生成(?:成功|好了|完毕|完成)|已(?:经)?完成|做好了)|"
@@ -1934,20 +2075,20 @@ class MuseEngine:
         base_agent, base_text, _ = self._poll_chat()
         self._send(prompt)
 
-        t_sent = time.time()
+        t_sent = time.monotonic()
         deadline = t_sent + timeout
         first_token_deadline = min(deadline, t_sent + 40.0)
         sent, last, stable = "", None, 0
         got_first = False
 
         # 1. 等待助手生成并开始吐字（高频 60ms 采样，捕获到首批增量文字瞬间 yield 出去）
-        while time.time() < first_token_deadline:
+        while time.monotonic() < first_token_deadline:
             if stop_event is not None and stop_event.is_set():
                 return
             time.sleep(0.06)
             cnt, cur, has_stop = self._poll_chat()
             if not cur or (cnt <= base_agent and cur == base_text):
-                if time.time() - t_sent > 14.0:
+                if time.monotonic() - t_sent > 14.0:
                     try:
                         tail = self.page.js("document.body.innerText.slice(-500)") or ""
                     except Exception:
@@ -1968,7 +2109,7 @@ class MuseEngine:
             raise MuseGenerationError("等待助手首字响应超时")
 
         # 2. 持续捕获增量文本
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             if stop_event is not None and stop_event.is_set():
                 return
             time.sleep(0.06)
@@ -2040,8 +2181,8 @@ class MuseEngine:
         })(%s)""" % json.dumps(src))
         if clicked == "none":
             return None
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             time.sleep(1.5)
             new = [f for f in (set(os.listdir(directory)) - before)
                    if not f.endswith(".crdownload")]
@@ -2159,15 +2300,18 @@ class MuseEngine:
     # 新版 muse 页面已没有 hatch-composer-placeholder-overlay，也不包 <form>：
     # 输入框所在容器是 textarea 往上第二层，附件的「Remove attachment」按钮在那里。
     # 旧结构（overlay / form）优先，新结构从 textarea 逐级向上找最近的一层。
+    # patch22g3：closest('form') 可能命中一个 React 空壳 form（线上实证
+    # form_len=0、composer 内容渲染在 form 外），此时必须回退逐级向上探索，
+    # 否则 composer root 是空壳 → 附件按钮永远数到 0（假性上传失败）。
     _COMPOSER_ROOTS_JS = """
         function __composerRoots(){
             var ov = document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');
             var legacy = ov ? (ov.closest('form') || ov.parentElement.parentElement.parentElement) : null;
-            if (legacy) return [legacy];
+            if (legacy && legacy.innerHTML.length > 100) return [legacy];
             var ta = document.querySelector('textarea');
             if (!ta) return [];
             var form = ta.closest('form');
-            if (form) return [form];
+            if (form && form.innerHTML.length > 100) return [form];
             var out = [], el = ta.parentElement;
             for (var i = 0; i < 4 && el && el !== document.body; i++) { out.push(el); el = el.parentElement; }
             return out;
@@ -2237,6 +2381,34 @@ class MuseEngine:
             return None
 
         self._clear_attachments()
+        # patch22g：composer 就绪门控——线上实证（patch22f 现场日志）DOM 可能
+        # 存在 textarea + input[type=file] 但 composer 容器为空（form_len=0，
+        # React 尚未把附件处理器挂到该 input 上），此时 setFileInputFiles 把
+        # 文件设进无 handler 的 input，附件永远不出现（30s 超时假失败）。
+        # 就绪判定 = composer root 内含 input[type=file] 且 root 内容非空。
+        _composer_ready_js = "(function(){" + self._COMPOSER_ROOTS_JS + """
+            var h = document.querySelector('[data-hatch-shell-hydration-state]');
+            // patch22h：与 _wait_ws_ready 同语义 fail-closed——hydration 标记
+            // 缺失 = React 事件委托未挂载，附件确认按钮永远数不到。
+            if (!h || h.getAttribute('data-hatch-shell-hydration-state') !== 'hydrated') return false;
+            var roots = __composerRoots();
+            for (var r of roots) {
+                if (r && r.querySelector('input[type=file]') && r.innerHTML.length > 200) return true;
+            }
+            return false;
+        })()"""
+        _ready_deadline = time.monotonic() + 15.0
+        while time.monotonic() < _ready_deadline:
+            try:
+                if self.page.js(_composer_ready_js):
+                    break
+            except Exception:
+                pass
+            time.sleep(0.3)
+        else:
+            raise MuseGenerationError(
+                "上传控件未就绪（composer 容器为空），已停止生成",
+                code="composer_not_ready", stage="upload", retryable=True)
         # Snap Chromium cannot read the host's /tmp; profile_dir is shared with it.
         os.makedirs(self.cfg.profile_dir, exist_ok=True)
         upload_dir = tempfile.mkdtemp(prefix="muse2api-refs-", dir=self.cfg.profile_dir)
@@ -2261,6 +2433,7 @@ class MuseEngine:
             # A remove button proves attachment presence, not upstream processing success.
             deadline = time.monotonic() + 30.0
             attached_count = 0
+            _reset_at = {i: 0.0 for i in range(len(files))}  # patch22g：每文件上次重设时间
             while time.monotonic() < deadline:
                 attached_count = self.page.js(self._ATTACHED_COUNT_JS)
                 try:  # patch13(F15)：js 异常时返回 dict，int(dict) 会裸抛 TypeError
@@ -2269,10 +2442,49 @@ class MuseEngine:
                     n_att = 0
                 if n_att >= len(files):
                     break
+                # patch22g：附件 5s 未出现 → 重设文件（composer 可能刚完成挂载，
+                # 首次 setFileInputFiles 打在了无 handler 的 input 上；重设会用
+                # _FILE_INPUT_JS 现查现取，命中已挂载的真实 input）。最多每文件
+                # 每 5s 一次，不放大 CDP 流量。
+                now = time.monotonic()
+                for i in range(n_att, len(files)):
+                    if now - _reset_at[i] >= 5.0:
+                        _reset_at[i] = now
+                        try:
+                            path_i = os.path.join(
+                                upload_dir, "reference_%d%s"
+                                % (i + 1, REFERENCE_MIME_EXT.get(files[i][2], '.bin')))
+                            self._set_input_files([path_i])
+                        except Exception:
+                            pass
+                        break
                 time.sleep(0.3)
             else:
+                # patch22d：上传确认失败属提交前失败——带 stage/code/retryable，
+                # worker 据此落 safe_to_resubmit=True（重发零计费风险），并让
+                # app 层 attempt 链能按提交前失败语义处理。
+                # patch22f：失败现场取证（仅诊断日志，不含凭据）——page 状态、
+                # file input、composer 按钮与 URL，用于定位 API 路径与 probe
+                # 直连的差异（probe 同序列 attach 1.3s 成功）。
+                try:
+                    _diag = self.page.js("""(function(){                        var ta = document.querySelector('textarea');
+                        var form = ta ? ta.closest('form') : null;
+                        return JSON.stringify({
+                            url: location.href, ready: document.readyState,
+                            ta: !!ta,
+                            n_file_inputs: document.querySelectorAll('input[type=file]').length,
+                            remove_btns: Array.from((form||document.body).querySelectorAll('button[aria-label]'))
+                                .map(function(b){return b.getAttribute('aria-label');})
+                                .filter(function(a){return /remove|attachment/i.test(a||'');}),
+                            form_len: form ? form.innerHTML.length : 0
+                        });
+                    })()""") or "{}"
+                    log.warning("【上传确认失败现场】%s", str(_diag)[:500])
+                except Exception as _ie:
+                    log.warning("【上传确认失败现场】诊断采集失败: %s", str(_ie)[:120])
                 raise MuseGenerationError(
-                    f"参考素材上传未确认（{int(attached_count or 0)}/{len(files)}），已停止生成")
+                    f"参考素材上传未确认（{int(attached_count or 0)}/{len(files)}），已停止生成",
+                    code="upload_unconfirmed", stage="upload", retryable=True)
             time.sleep(0.5)
             return {"dir": upload_dir, "hashes": hashes}
         except Exception:
@@ -2360,7 +2572,11 @@ class MuseEngine:
             selected_src = (att.get("vSrc") if expect == "video" else None) or att.get("src") or ""
             _cb(on_stage, "extract")
             try:
-                data, mime, url = self.extract_bytes(selected_src, expect=expect)
+                # patch22r：接线 stop_event——patch13(F7) 在 extract_bytes 内
+                # 加了取消检查但唯一调用点没传参，检查恒不生效（blob 回取
+                # 反复失败时 4×600s ≈ 40 分钟独占账号不可取消）。
+                data, mime, url = self.extract_bytes(selected_src, expect=expect,
+                                                     stop_event=stop_event)
             except Exception:  # noqa: BLE001
                 self._debug_dump("extract-fail")
 
@@ -2473,15 +2689,9 @@ class MuseEngine:
 
     @staticmethod
     def _debug_enabled() -> bool:
-        # patch13(F16)：debug dump 默认关——tail 含用户 prompt 与模型回复明文，
-        # 多用户场景下等于把用户内容留盘。MUSE2API_DEBUG_DUMP=1 显式开启。
-        import os as _os
-        return _os.environ.get("MUSE2API_DEBUG_DUMP", "0").strip() == "1"
-
-    @staticmethod
-    def _debug_enabled() -> bool:
         # patch13(F16)：debug dump 默认关——dump 含用户 prompt 与模型回复明文，
         # 多用户场景下等于把用户内容留盘。MUSE2API_DEBUG_DUMP=1 显式开启。
+        # patch22r：删除重复定义（merge 时引入的双胞胎方法，取后者语义）。
         return os.environ.get("MUSE2API_DEBUG_DUMP", "0").strip() == "1"
 
     def _debug_dump(self, tag: str):

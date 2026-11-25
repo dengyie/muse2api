@@ -1,0 +1,208 @@
+<!doctype html>
+<!-- patch27 远程登录控制页：CDP 串流画面 + 键鼠转发。
+     本页即「服务器浏览器」的遥控器——谁拿到链接谁可操作，15 分钟有效。
+     令牌经 query 传入 WS；页面不落任何 cookie/凭据（凭据不出服务器）。 -->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>muse.ai 远程登录</title>
+<style>
+  :root{ color-scheme: dark; }
+  *{ box-sizing:border-box; }
+  body{ margin:0; background:#0b0f19; color:#e6e8ee; font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+        display:flex; flex-direction:column; align-items:center; min-height:100vh; padding:16px; }
+  h1{ font-size:18px; margin:4px 0 2px; }
+  .sub{ color:#8b93a7; font-size:12px; margin-bottom:10px; text-align:center; }
+  #stage{ position:relative; background:#000; border:1px solid #232a3d; border-radius:10px;
+          overflow:hidden; max-width:96vw; line-height:0; }
+  #screen{ display:block; max-width:100%; cursor:crosshair; }
+  #cover{ position:absolute; inset:0; display:flex; flex-direction:column; gap:8px;
+          align-items:center; justify-content:center; background:rgba(11,15,25,.88);
+          font-size:14px; color:#c8cede; line-height:1.6; padding:20px; text-align:center; }
+  #cover.hidden{ display:none; }
+  #bar{ display:flex; gap:14px; align-items:center; margin-top:10px; font-size:13px; color:#9aa2b5; flex-wrap:wrap; justify-content:center; }
+  .dot{ width:8px; height:8px; border-radius:50%; background:#555; display:inline-block; margin-right:5px; }
+  .dot.ok{ background:#3fb26f; } .dot.err{ background:#e05252; } .dot.warn{ background:#d9a53f; }
+  .kbd{ border:1px solid #333c55; border-radius:4px; padding:1px 6px; font-size:11px; color:#aeb6c8; }
+  #fps{ min-width:64px; display:inline-block; }
+  #urlbar{ display:flex; gap:8px; margin-top:8px; width:min(720px, 94vw); }
+  #urlbar input{ flex:1; background:#111827; border:1px solid #2a3448; border-radius:8px;
+                 color:#e6e8ee; padding:8px 12px; font-size:13px; }
+  #urlbar input:focus{ outline:none; border-color:#4a6fa5; }
+  #urlbar button{ background:#2d5da9; border:none; border-radius:8px; color:#fff;
+                  padding:8px 16px; font-size:13px; cursor:pointer; white-space:nowrap; }
+  #urlbar button:hover{ background:#3a6cb8; }
+  #urlbar button:disabled{ opacity:.5; cursor:default; }
+</style>
+</head>
+<body>
+<h1>🖥 muse.ai 远程登录</h1>
+<div class="sub">下面的画面就是服务器上的浏览器 —— 你在这里登录，Cookie 自动保存在服务器并入库，本页不保存任何凭据。</div>
+
+<div id="stage">
+  <canvas id="screen" width="1280" height="800"></canvas>
+  <div id="cover">正在连接服务器浏览器…<br><span style="font-size:12px;color:#7d8598">若长时间无画面请刷新或回到管理页重新生成链接</span></div>
+</div>
+
+<div id="bar">
+  <span><span class="dot" id="stDot"></span><span id="stText">连接中</span></span>
+  <span id="fps">0 fps</span>
+  <span>输入密码可用 <span class="kbd">Ctrl+V</span> 直接粘贴</span>
+</div>
+
+<!-- patch27e：发送登录链接——magic link 是 URL，须让服务器浏览器导航过去；
+     本页在 http:// 内网 IP 上属非安全上下文，navigator.clipboard 不可用，
+     Ctrl+V 读剪贴板会静默失败，故提供显式输入条（粘贴到框内点发送）。 -->
+<div id="urlbar">
+  <input id="urlInput" type="url" placeholder="粘贴 muse.ai 登录链接（邮件里的 magic link），点发送即跳转" autocomplete="off" spellcheck="false">
+  <button id="urlGo">发送 →</button>
+</div>
+
+<script>
+(function(){
+  const $ = id => document.getElementById(id);
+  const canvas = $('screen'), ctx = canvas.getContext('2d');
+  const cover = $('cover'), dot = $('stDot'), stText = $('stText'), fpsEl = $('fps');
+
+  const qs = new URLSearchParams(location.search);
+  const token = qs.get('token') || '';
+  let ws = null, frames = 0, fpsT = performance.now(), closed = false;
+
+  function setStatus(cls, text){ dot.className = 'dot ' + (cls||''); stText.textContent = text; }
+
+  // ---------- 画面绘制 ----------
+  function drawFrame(b64, meta){
+    const img = new Image();
+    img.onload = () => {
+      if (meta && (meta.pageX || meta.scrollOffsetX !== undefined)) {
+        // 串流画面即视口尺寸（scrollOffset 0 起步）；尺寸变化则跟随
+      }
+      if (canvas.width !== img.width || canvas.height !== img.height){
+        canvas.width = img.width; canvas.height = img.height;
+      }
+      ctx.drawImage(img, 0, 0);
+      cover.classList.add('hidden');
+      frames++;
+      const now = performance.now();
+      if (now - fpsT >= 1000){ fpsEl.textContent = frames + ' fps'; frames = 0; fpsT = now; }
+    };
+    img.src = 'data:image/jpeg;base64,' + b64;
+  }
+
+  // ---------- 坐标换算（canvas 显示尺寸 → 页面视口坐标） ----------
+  function pos(e){
+    const r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left) * (canvas.width / r.width),
+             y: (e.clientY - r.top) * (canvas.height / r.height) };
+  }
+
+  // ---------- 键鼠转发 ----------
+  const BTN = {0:'left',1:'middle',2:'right'};
+  canvas.addEventListener('mousemove', e => { const p = pos(e);
+    send({t:'mouse', type:'mouseMoved', x:Math.round(p.x), y:Math.round(p.y)}); });
+  canvas.addEventListener('mousedown', e => { const p = pos(e);
+    send({t:'mouse', type:'mousePressed', x:Math.round(p.x), y:Math.round(p.y),
+          button:BTN[e.button]||'left', clickCount:1}); e.preventDefault(); });
+  canvas.addEventListener('mouseup', e => { const p = pos(e);
+    send({t:'mouse', type:'mouseReleased', x:Math.round(p.x), y:Math.round(p.y),
+          button:BTN[e.button]||'left', clickCount:1}); e.preventDefault(); });
+  canvas.addEventListener('wheel', e => { const p = pos(e);
+    send({t:'wheel', x:Math.round(p.x), y:Math.round(p.y),
+          deltaX:e.deltaX, deltaY:e.deltaY}); e.preventDefault(); }, {passive:false});
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+  // patch27e：发送登录链接输入条——先取引用再注册键盘监听（避免 TDZ 歧义）
+  const urlInput = $('urlInput'), urlGo = $('urlGo');
+
+  // 键盘：文本键走 dispatchKeyEvent(text)，Ctrl+V 整段粘贴走 insert（密码框友好）
+  // patch27e：非安全上下文（http 内网 IP）navigator.clipboard 不存在——
+  // 失败时提示改用下方输入条，不再静默吞掉。
+  window.addEventListener('keydown', e => {
+    if (e.key === 'F5'){ return; }                 // 放行刷新本页
+    if (e.target === urlInput) return;             // 输入框内正常打字，不拦截
+    e.preventDefault();
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'v' || e.key === 'V')){
+      if (navigator.clipboard && navigator.clipboard.readText){
+        navigator.clipboard.readText().then(txt => {
+          if (txt) send({t:'insert', text:txt});
+        }).catch(()=> setStatus('warn','此页面读不了剪贴板：请粘贴到下方输入条'));
+      } else {
+        setStatus('warn','此页面读不了剪贴板：请粘贴到下方输入条');
+      }
+      return;
+    }
+    send({t:'key', type:'keyDown', key:e.key, code:e.code,
+          modifiers:(e.ctrlKey?2:0)|(e.altKey?1:0)|(e.shiftKey?8:0)|(e.metaKey?4:0),
+          text: e.key.length === 1 && !e.ctrlKey && !e.metaKey ? e.key : undefined});
+  });
+  window.addEventListener('keyup', e => {
+    if (e.key === 'F5'){ return; }                 // 放行刷新本页
+    if (e.target === urlInput) return;             // 输入框内打字不转发（patch27e）
+    e.preventDefault();
+    send({t:'key', type:'keyUp', key:e.key, code:e.code});
+  });
+
+  // 视口上报：让服务端把远程页面 resize 到接近本页可视比例
+  function reportViewport(){
+    const r = canvas.getBoundingClientRect();
+    if (r.width > 0) send({t:'viewport', w: Math.max(800, Math.round(r.width)),
+                                      h: Math.max(600, Math.round(r.width * 0.75))});
+  }
+
+  function send(obj){ if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+
+  // ---------- 发送登录链接（patch27e） ----------
+  // magic link 是 URL：走 goto 让服务器浏览器直接导航（服务端限 muse.ai 域）
+  function sendUrl(){
+    const u = urlInput.value.trim();
+    if (!u) return;
+    if (!/^https?:\/\//i.test(u)){ setStatus('warn','链接须以 http(s):// 开头'); return; }
+    send({t:'goto', url:u});
+    urlInput.value = '';
+    urlGo.textContent = '已发送 ✓';
+    setTimeout(()=>{ urlGo.textContent = '发送 →'; }, 1500);
+  }
+  urlGo.addEventListener('click', sendUrl);
+  urlInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter'){ sendUrl(); }
+    e.stopPropagation();     // 不让按键漏进全局转发（否则打字会打到画面里）
+  });
+
+  // ---------- WS 连接 ----------
+  function connect(){
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${proto}://${location.host}/ws/remote-login?token=${encodeURIComponent(token)}`);
+    ws.onopen = () => { setStatus('ok','已连接'); reportViewport(); };
+    ws.onmessage = ev => {
+      let m; try{ m = JSON.parse(ev.data); }catch(_){ return; }
+      switch(m.t){
+        case 'frame': drawFrame(m.img, m.meta); break;
+        case 'status': break;
+        case 'done':
+          setStatus('ok', `登录成功！账号 ${m.label || m.id} 已入库（cookie ${m.cookie_count} 个，出口${m.bound ? '已绑定' : '稍后心跳补绑'}）`);
+          cover.classList.remove('hidden');
+          cover.innerHTML = '✅ 登录成功，账号已入库<br><span style="font-size:12px;color:#7d8598">本页可以关闭了</span>';
+          closed = true; ws.close();
+          break;
+        case 'timeout':
+          setStatus('warn','链接已超时（15 分钟），请回管理页重新生成');
+          break;
+        case 'error':
+          setStatus('err','出错了：' + (m.msg || '未知错误'));
+          break;
+      }
+    };
+    ws.onclose = () => {
+      if (closed) return;
+      setStatus('err','连接断开');
+      cover.classList.remove('hidden');
+      cover.innerHTML = '连接已断开<br><span style="font-size:12px;color:#7d8598">刷新本页可重连（令牌未用完且未过期时有效）</span>';
+    };
+    ws.onerror = () => setStatus('err','连接失败');
+  }
+  connect();
+})();
+</script>
+</body>
+</html>

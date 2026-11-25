@@ -15,6 +15,7 @@ sys.path.insert(0,str(ROOT))
 HOME=tempfile.TemporaryDirectory(prefix='m2a-release-integration-')
 os.environ.update(MUSE2API_HOME=HOME.name,MUSE2API_PROFILE_ROOT=HOME.name,MUSE2API_KEY='fixture-only')
 import app
+import updater
 import requests
 from store import Store
 from test_media_delete import Client
@@ -34,8 +35,8 @@ class ReleaseIntegrationTests(unittest.TestCase):
     def test_remote_metadata_is_bound_to_the_reported_commit(self):
         seen=[]
         def get(url,**kw):seen.append(url);return remote(url,**kw)
-        with patch('requests.get',side_effect=get),patch.object(app,'_read_local_version',return_value={'version':'1.6.10'}),patch.dict(os.environ,{'MUSE2API_BUILD_SHA':'a'*40}):
-            data=app._check_update_sync(force=True)
+        with patch('requests.get',side_effect=get),patch.object(updater,'_read_local_version',return_value={'version':'1.6.10'}),patch.dict(os.environ,{'MUSE2API_BUILD_SHA':'a'*40}):
+            data=updater.check(force=True)
         self.assertEqual(data['local_version'],'1.6.10')
         self.assertEqual(data['remote_commit'],COMMIT)
         self.assertTrue(any('/'+COMMIT+'/version.json' in url for url in seen),seen)
@@ -43,16 +44,16 @@ class ReleaseIntegrationTests(unittest.TestCase):
     def test_git_worktree_reports_its_real_commit(self):
         expected=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()[:7]
         with patch('requests.get',side_effect=remote),patch.dict(os.environ,{'MUSE2API_BUILD_SHA':''}):
-            data=app._check_update_sync(force=True)
+            data=updater.check(force=True)
         self.assertTrue(data['has_git'])
         self.assertEqual(data['local_sha'],expected)
 
     def test_new_modules_are_in_docker_and_maintainer_copy_lists(self):
         docker=(ROOT/'Dockerfile').read_text()
         for name in ['generation_timing.py','thumbnails.py']:
-            self.assertIn(name,docker);self.assertIn(name,app.TRACKED_REPO_PATHS)
+            self.assertIn(name,docker);self.assertIn(name,updater.TRACKED_REPO_PATHS)
         for name in ['GENERATION_QUEUE.md','VERSION_REPORTING.md']:
-            self.assertIn(name,app.TRACKED_REPO_PATHS)
+            self.assertIn(name,updater.TRACKED_REPO_PATHS)
 
     def test_queue_put_preflight_is_allowed(self):
         async def check():
@@ -111,9 +112,10 @@ class ReleaseIntegrationTests(unittest.TestCase):
             self.assertFalse(lock.locked());self.assertFalse(pool.busy_accounts)
 
     def test_active_tasks_reject_manual_upgrade_before_network(self):
-        with patch.object(app,'MANAGED_DEPLOYMENT',False),patch.object(app.store,'tasks',{'fixture':{'status':'queued'}}),patch('requests.get')as get:
-            with self.assertRaises(app.HTTPException)as cm:app._upgrade_from_github_sync()
-        self.assertEqual(cm.exception.status_code,409);get.assert_not_called()
+        with patch.object(updater,'MANAGED_DEPLOYMENT',False),patch('requests.get')as get:
+            # busy 检查已迁 app 层（依赖方向：updater 不感知业务并发面），由调用方注入
+            with self.assertRaises(updater.UpdaterError)as cm:updater.upgrade(busy=lambda: True)
+        self.assertEqual(cm.exception.status,409);get.assert_not_called()
 
 if __name__=='__main__':
     unittest.main(verbosity=2)

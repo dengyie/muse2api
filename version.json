@@ -1,22 +1,22 @@
 {
   "version": "1.6.11",
-  "updated_at": "2026-11-16",
+  "updated_at": "2026-11-19",
   "repo": "https://github.com/czg86389-hub/muse2api",
   "fork": true,
   "highlights": [
-    "合并上游 1.6.11 全部新特性：未分配工作区不再丢弃轮换 Cookie（MuseSessionUnavailable + cookie_sink 持久化）。",
-    "图片/视频独立排队时限（默认 3600 秒，0 为不限）；排队不消耗生成预算，失败记录保留账号、尝试次数与原始错误。",
-    "媒体库视频缩略图（懒加载，Docker 镜像已含 FFmpeg）与 /admin/generation-queue 排队设置端点。",
-    "浏览器插件升级至 1.0.3：按当前普通/无痕窗口读取 Cookie，找不到存储区时停止导入。",
-    "patch21（事故封堵）：静默自更新默认永久关闭（MUSE2API_AUTO_UPGRADE 显式开启才生效）——2026-11-16 Tarball 覆盖事故根因修复，本 fork 补丁不在上游，任何自动覆盖都会整树回退。",
-    "继续保留二开 7-20 全部补丁：TetherPool 出口托管、per-account 指纹隔离、幂等/并发/重绑/attempt 审计等。"
+    "patch22r（全项目深度 review 根修）SSE 断连死锁根治（账号租约/并发槽位泄漏）、extract 取消接线、store 双文件写序+fsync、幂等索引抽取双域统一（图片域补齐落盘）。",
+    "patch22r 可靠性：engine.start() CDP 探活自愈、页面死检测快速换号、TetherPool 重绑去重（约束不再丢失）、备份/回源退避分离、回源超时按体积伸缩。",
+    "patch22r 安全：key 日志脱敏+rotate 持久化进 data 卷、/v1/videos 轮询字段白名单（prompt 不再全量回显）、媒体回源负缓存防未鉴权放大、扩展 popup XSS 根治（host_permissions 收窄+动态申请）。",
+    "patch22r 门禁：requirements 钉版+dev 组、真实 TestClient 冒烟回归（22o-fix 类启动事故部署前可检出）、compose/Dockerfile 防漂移（TASKS_MAX 2000 回写、HEALTHCHECK、MANAGED_DEPLOYMENT、mem_limit 2500m）。",
+    "浏览器插件升级至 1.0.4：popup 日志改 textContent 免疫注入，服务地址权限改为动态申请（optional_host_permissions）。升级为手动操作：chrome://extensions 重新加载扩展（每个浏览器 profile 各自一次）；较 1.0.3 的差异会自动提示。",
+    "继续保留二开 7-22q 全部补丁：TetherPool 出口托管、per-account 指纹隔离、幂等/并发/重绑/attempt 审计、归档索引与任务保留加固等。"
   ],
   "highlights_en": [
-    "Merged upstream 1.6.11: cookies rotated by unassigned-workspace responses are preserved via MuseSessionUnavailable and the cookie sink.",
-    "Image/video queue waits have a separate budget (3600s default; 0 = unlimited); failed tasks retain account, attempt and original error.",
-    "Lazy video thumbnails in the media library (Docker image ships FFmpeg) plus the /admin/generation-queue settings endpoints.",
-    "Extension 1.0.3 reads the active regular/incognito window cookie store and stops on identification failure.",
-    "patch21 (incident hardening): the silent self-updater is now disabled by default (opt-in via MUSE2API_AUTO_UPGRADE) — root cause of the 2026-11-16 tarball-overwrite outage; this fork's patches never exist upstream.",
-    "All local patches 7-20 remain: TetherPool egress management, per-account fingerprint isolation, idempotency, concurrency, rebind and attempt audit."
+    "patch22r (full-project deep review root fixes): SSE disconnect deadlock eliminated (lease/slot leak), extract cancel wiring, store two-file write order + fsync, idempotency index unified for video+image (image domain now persisted).",
+    "patch22r reliability: engine.start() CDP liveness self-heal, page-lost fast-fail with account rotation, TetherPool double-acquire removed (constraints preserved), backup/delivery backoff split, size-based fetch timeout.",
+    "patch22r security: key log masking + rotate persistence inside data volume, /v1/videos polling whitelist (no prompt echo), media negative cache vs unauth amplification, extension popup XSS root fix (narrowed host_permissions + dynamic request).",
+    "patch22r gating: pinned requirements + dev extras, real TestClient smoke regression (startup-cycle incidents now caught pre-deploy), compose/Dockerfile drift guards (TASKS_MAX 2000, HEALTHCHECK, MANAGED_DEPLOYMENT, mem_limit 2500m).",
+    "Extension 1.0.4: popup log switched to textContent (injection-immune), service-origin permission now requested dynamically (optional_host_permissions). Upgrade is manual: reload the extension at chrome://extensions (once for every browser profile); the notice appears automatically vs 1.0.3.",
+    "All local patches 7-22q remain: TetherPool egress management, per-account fingerprint isolation, idempotency, concurrency, rebind, attempt audit, archive index and task retention hardening."
   ]
 }
