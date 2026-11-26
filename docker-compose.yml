@@ -2,15 +2,7 @@ version: '3.8'
 
 services:
   muse2api:
-    build:
-      context: .
-      # patch22r-review：防御位——`docker compose build` 不带 --build-arg 时
-      # 镜像仍带可辨识 SHA（正式溯源走部署 SOP 的 CLI build --build-arg）。
-      args:
-        # patch25：引用式——部署 SOP 用 .env 或环境变量注入真值 SHA，
-        # 未注入时防御位回落 "dev"（可辨识非正式构建）。
-        BUILD_SHA: "${MUSE2API_BUILD_SHA:-dev}"
-    image: muse2api:tp
+    image: ${MUSE2API_IMAGE:-ghcr.io/dengyie/muse2api:latest}
     container_name: muse2api
     restart: always
     ports:
@@ -61,14 +53,9 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
-    shm_size: '2gb' # 保证 Chromium 渲染多标签页时不因 /dev/shm 耗尽崩溃
-    # patch22r：资源上限（4C4G 共享宿主，Chromium/ffmpeg 尖峰无界会拖垮
-    # 同宿主服务且 OOM killer 命中对象不可控）。
-    # ⚠️ 权衡记录：2500m × MUSE2API_CONCURRENCY=8 满并发理论上可自 OOM
-    # （容器 restart 自愈，优于拖垮宿主其它服务）——扩号池/调大并发时
-    # 按每 context ~200MB 复核此值。
-    mem_limit: 2500m
-    memswap_limit: 2500m
+    shm_size: '1gb' # 保证 Chromium 渲染多标签页时不因 /dev/shm 耗尽崩溃，同时避免 4G 宿主过量占内存
+    mem_limit: 2048m
+    memswap_limit: 2048m
     # patch22r：健康检查（配合 restart: always 具备僵死探测——线程死锁类
     # 故障进程不退出，原配置 restart 永不触发）
     healthcheck:
