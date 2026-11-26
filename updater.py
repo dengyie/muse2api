@@ -39,9 +39,9 @@ class UpdaterError(Exception):
         self.status = status
 
 
-REPO_SLUG = os.environ.get("MUSE2API_REPOSITORY", "czg86389-hub/muse2api")
+REPO_SLUG = os.environ.get("MUSE2API_REPOSITORY", "dengyie/muse2api")
 if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", REPO_SLUG):
-    REPO_SLUG = "czg86389-hub/muse2api"
+    REPO_SLUG = "dengyie/muse2api"
 REPO_REF = os.environ.get("MUSE2API_REPO_REF", "main")
 REPO_URL = f"https://github.com/{REPO_SLUG}"
 MANAGED_DEPLOYMENT = os.environ.get("MUSE2API_MANAGED_DEPLOYMENT", "0") == "1"

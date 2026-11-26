@@ -1,7 +1,7 @@
 {
   "version": "1.6.11",
   "updated_at": "2026-11-19",
-  "repo": "https://github.com/czg86389-hub/muse2api",
+  "repo": "https://github.com/dengyie/muse2api",
   "fork": true,
   "highlights": [
     "patch22r（全项目深度 review 根修）SSE 断连死锁根治（账号租约/并发槽位泄漏）、extract 取消接线、store 双文件写序+fsync、幂等索引抽取双域统一（图片域补齐落盘）。",

@@ -230,7 +230,7 @@
       <span class="brand-mark" data-ui-icon="sparkles" data-ui-size="16"></span>
       <span>muse2api</span>
       <small>Muse 网页额度 · 反代控制台</small>
-      <a href="https://github.com/czg86389-hub/muse2api" target="_blank" id="repoHomeLink" class="pill" style="margin-left:6px;text-decoration:none;color:var(--text);cursor:pointer" title="打开 GitHub 开源仓库">
+      <a href="https://github.com/dengyie/muse2api" target="_blank" id="repoHomeLink" class="pill" style="margin-left:6px;text-decoration:none;color:var(--text);cursor:pointer" title="打开 GitHub 开源仓库">
         <span data-ui-icon="git-branch" data-ui-size="13"></span>
         <b>GitHub</b>
       </a>
@@ -281,7 +281,7 @@
     <h3>
       <svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg>
       仓库版本检测与更新
-      <a href="https://github.com/czg86389-hub/muse2api" target="_blank" id="repoPanelLink" class="tag" style="color:var(--accent)">czg86389-hub/muse2api ↗</a>
+      <a href="https://github.com/dengyie/muse2api" target="_blank" id="repoPanelLink" class="tag" style="color:var(--accent)">dengyie/muse2api ↗</a>
       <span id="repoBadge" class="badge info" style="margin-left:auto">检测中…</span>
     </h3>
     <div class="hint" id="repoStatusDesc" data-i18n="repo-status-desc">正在实时对比本地版本与 GitHub 官方仓库最新版本…（在线升级自动保留 <code>.env</code> 密钥与 <code>data/</code> 账号池及媒体数据）</div>
@@ -289,7 +289,7 @@
     <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
       <button onclick="upgradeNow()" id="btnRepoPull"><span data-ui-icon="zap" data-ui-size="14"></span> 一键从 GitHub 在线更新并重启</button>
       <button class="ghost" onclick="loadRepoStatus(true)"><span data-ui-icon="search" data-ui-size="14"></span> 立即重新检测更新</button>
-      <a id="repoCommitsLink" href="https://github.com/czg86389-hub/muse2api/commits/main" target="_blank" class="btnlike ghostlike" style="padding:7px 13px;font-size:12.5px">查看 GitHub 完整提交记录 ↗</a>
+      <a id="repoCommitsLink" href="https://github.com/dengyie/muse2api/commits/main" target="_blank" class="btnlike ghostlike" style="padding:7px 13px;font-size:12.5px">查看 GitHub 完整提交记录 ↗</a>
     </div>
   </div>
 
@@ -805,7 +805,7 @@ t = requests.post(<span class="s">"BASE/v1/videos"</span>, json={<span class="s"
 </main>
 
 <footer style="max-width:1280px;margin:18px auto 32px;padding:12px 24px;text-align:center;color:var(--muted);font-size:12px;border-top:1px solid var(--line)">
-  <span>开源仓库：<a href="https://github.com/czg86389-hub/muse2api" target="_blank" style="color:var(--accent);text-decoration:none">GitHub · muse2api</a></span>
+  <span>开源仓库：<a href="https://github.com/dengyie/muse2api" target="_blank" style="color:var(--accent);text-decoration:none">GitHub · dengyie/muse2api</a></span>
 </footer>
 
 <toast-stack id="toastStack" duration="4000"></toast-stack>
@@ -963,7 +963,7 @@ const I18N_EN = {
   "账号或任务正在使用中，请稍后重试 (HTTP 409)": "The account or task is busy; retry later (HTTP 409)",
   "muse2api · 账号池控制台": "muse2api · Account Pool Console",
   "Muse 网页额度 · 反代 API": "Muse web quota · Reverse-proxy API",
-  "打开 GitHub 开源仓库 (https://github.com/czg86389-hub/muse2api)": "Open the GitHub repository (https://github.com/czg86389-hub/muse2api)",
+  "打开 GitHub 开源仓库 (https://github.com/dengyie/muse2api)": "Open the GitHub repository (https://github.com/dengyie/muse2api)",
   "GitHub 仓库": "GitHub repo",
   "查看官方仓库最新版本状态与更新通知": "View the latest version status and update notices from the official repository",
   "版本检测": "Version check",
