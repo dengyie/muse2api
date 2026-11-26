@@ -44,6 +44,7 @@ COPY admin.html status.html remote_login.html login_session.py credentials.py au
 COPY deploy/ ./deploy/
 COPY extension/ ./extension/
 COPY tools/ ./tools/
+COPY ui/ ./ui/
 
 # 创建持久化数据目录
 RUN mkdir -p /app/data/media /app/data/downloads /root/muse2api-profiles

@@ -377,7 +377,7 @@
           <span class="badge ok" id="keepaliveBadge" style="font-size:11px">● 自动保活轮转中 (30m)</span>
         </div>
         <div style="display:flex;gap:8px">
-          <a href="/status" class="secondary" style="font-size:12px;padding:6px 14px;text-decoration:none;display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:8px;color:var(--fg)">📊 状态与额度看板</a>
+          <a href="/status" id="statusBoardLink" class="secondary" style="font-size:12px;padding:6px 14px;text-decoration:none;display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:8px;color:var(--fg)">状态与额度看板</a>
           <button class="secondary" onclick="openAuthProfile(null)" style="font-size:12px;padding:6px 14px">+ 凭据登录添加</button>
           <button class="secondary" id="btnKeepaliveAll" onclick="keepaliveAll()" style="font-size:12px;padding:6px 14px">⚡ 一键保活所有账号</button>
         </div>
@@ -1878,8 +1878,8 @@ async function loadPool(){
       const miss = a.essential_ok ? '' : ' <span class="badge bad" title="缺少核心 cookie，无法生成">缺核心</span>';
       const ap = a.auth_profile;
       const authBadge = !ap ? ''
-        : ap.needs_manual ? ` <span class="badge warn" title="${esc(ap.last_relogin_error || '需要人工接管')}">⚠️ 需人工</span>`
-        : ` <span class="badge info" title="${esc(ap.identifier_masked || '')}">${ap.auth_type === 'email_otp' ? '📧 OTP' : '🔑 密码'}</span>`;
+        : ap.needs_manual ? ` <span class="badge warn" title="${esc(ap.last_relogin_error || '需要人工接管')}">需人工</span>`
+        : ` <span class="badge info" title="${esc(ap.identifier_masked || '')}">${ap.auth_type === 'email_otp' ? '邮箱 OTP' : '密码'}</span>`;
       return `<tr>
         <td><b>${esc(a.label)}</b><div class="mono ellip proxy-summary" title="${esc(a.proxy?.server || '默认网络')}">${esc(a.proxy?.server || '默认网络')}</div>${proxyStatus(a)}</td>
         <td class="mono">${esc(a.id)}</td>
@@ -2666,6 +2666,11 @@ setInterval(() => {
 setInterval(() => {
   loadRepoStatus(false);
 }, 60000);
+</script>
+<script type="module">
+  import uiIcon from '/ui/UiIcon.js';
+  const sb = document.getElementById('statusBoardLink');
+  if (sb) sb.insertAdjacentHTML('afterbegin', uiIcon('layers', { size: 14 }));
 </script>
 </body>
 </html>

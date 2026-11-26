@@ -4122,6 +4122,30 @@ def status_page():
     return HTMLResponse(_status_html(), headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"})
 
 
+_UI_ALLOWED_FILES = frozenset({
+    "UiIcon.js",
+    "StatusIndicator.js",
+    "ThemeToggle.js",
+    "SpotlightGlareCard.js",
+    "AnimatedCounter.js",
+    "ToastStack.js",
+    "EmptyState.js",
+    "StreamingProgressBar.js",
+})
+
+
+@app.get("/ui/{filename}")
+def ui_asset(filename: str):
+    if filename not in _UI_ALLOWED_FILES:
+        raise HTTPException(404, "资源不存在")
+    for d in (CFG.base_dir, os.path.dirname(os.path.abspath(__file__))):
+        p = os.path.join(d, "ui", filename)
+        if os.path.isfile(p):
+            return FileResponse(p, media_type="application/javascript",
+                                headers={"Cache-Control": "public, max-age=3600"})
+    raise HTTPException(404, "资源不存在")
+
+
 
 # ------------------------- 账号自动保活与静默续期 -------------------------
 KEEPALIVE_LOCK = asyncio.Lock()
