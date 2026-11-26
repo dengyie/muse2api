@@ -4067,16 +4067,27 @@ def _admin_html() -> str:
                 "<p>接口可用：<code>/v1/images/generations</code>、"
                 "<code>/v1/videos</code></p></body>")
 
-def _admin_html_injected() -> str:
-    """patch27b：管理页 KEY 自动注入——KEY 织入页面 JS，内网用户免手填。
+def _is_internal_admin_request(request: Request | None) -> bool:
+    """仅当经由本机/内网直连且非 Cloudflare 公网代理时，才允许自动注入管理 KEY。"""
+    if request is None:
+        return False
+    if request.headers.get("cf-connecting-ip") or request.headers.get("cf-ray"):
+        return False
+    host = (request.client.host if request.client else "") or ""
+    if host in ("127.0.0.1", "::1", "localhost"):
+        return True
+    try:
+        import ipaddress
+        ip = ipaddress.ip_address(host)
+        return ip.is_private or ip.is_loopback
+    except ValueError:
+        return False
 
-    信任域论证：本服务无公网入口（公网仅 22+48721），管理页只经 mesh 内网
-    nginx（10.144.144.1:18610）触达，与 .env 明文存 KEY 同一信任域；注入的
-    KEY 不落 localStorage 之外的任何新位置（页面拿到后仍走原 KEY 内存变量），
-    URL 无 ?key= 残留（patch22r 红线保持）。无 KEY 部署时原样返回零变化。
-    """
+
+def _admin_html_injected(request: Request | None = None) -> str:
+    """patch27b：管理页 KEY 自动注入——仅限内网/mesh 直连；公网域名访问不注入。"""
     html = _admin_html()
-    if not CFG.api_key:
+    if not CFG.api_key or not _is_internal_admin_request(request):
         return html
     marker = "let KEY = localStorage.getItem(KEY_STORE) || new URLSearchParams(location.search).get('key') || '';"
     inject = ("let KEY = localStorage.getItem(KEY_STORE) "
@@ -4087,14 +4098,28 @@ def _admin_html_injected() -> str:
     return html
 
 
+def _status_html() -> str:
+    for d in (CFG.base_dir, os.path.dirname(os.path.abspath(__file__))):
+        p = os.path.join(d, "status.html")
+        if os.path.isfile(p):
+            with open(p, encoding="utf-8") as f:
+                return f.read()
+    return "<html><body><h2>muse2api</h2><p>status.html 缺失。</p></body></html>"
+
+
 @app.get("/", response_class=HTMLResponse)
-def index():
-    return HTMLResponse(_admin_html_injected(), headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"})
+def index(request: Request):
+    return HTMLResponse(_admin_html_injected(request), headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"})
 
 
 @app.get("/admin", response_class=HTMLResponse)
-def admin_page():
-    return HTMLResponse(_admin_html_injected(), headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"})
+def admin_page(request: Request):
+    return HTMLResponse(_admin_html_injected(request), headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"})
+
+
+@app.get("/status", response_class=HTMLResponse)
+def status_page():
+    return HTMLResponse(_status_html(), headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"})
 
 
 
