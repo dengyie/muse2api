@@ -260,7 +260,7 @@
 
 <main>
   <!-- 实时新版本更新通知横幅（当官方仓库有新提交/新版本时自动向所有已部署用户弹出） -->
-  <div class="banner" id="updateBanner" style="border-color:rgba(79,140,255,.65);background:linear-gradient(90deg,rgba(79,140,255,.16),rgba(167,139,250,.05));align-items:center;justify-content:space-between;flex-wrap:wrap">
+  <div class="banner" id="updateBanner" style="border-color:color-mix(in srgb,var(--accent) 45%,transparent);background:color-mix(in srgb,var(--accent) 8%,var(--panel));align-items:center;justify-content:space-between;flex-wrap:wrap">
     <div style="display:flex;gap:12px;align-items:flex-start;flex:1;min-width:260px">
       <span class="ic" data-ui-icon="sparkles" data-ui-size="18"></span>
       <div>
@@ -396,7 +396,7 @@
           <span class="badge ok" id="keepaliveBadge" style="font-size:11px">● 自动保活轮转中 (30m)</span>
         </div>
         <div style="display:flex;gap:8px">
-          <a href="/status" id="statusBoardLink" class="secondary" style="font-size:12px;padding:6px 14px;text-decoration:none;display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:8px;color:var(--fg)">状态与额度看板</a>
+          <a href="/status" id="statusBoardLink" class="secondary" style="font-size:12px;padding:6px 14px;text-decoration:none;display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:8px;color:var(--text)">状态与额度看板</a>
           <button class="secondary" onclick="openAuthProfile(null)" style="font-size:12px;padding:6px 14px">+ 凭据登录添加</button>
           <button class="secondary" id="btnKeepaliveAll" onclick="keepaliveAll()" style="font-size:12px;padding:6px 14px"><span data-ui-icon="zap" data-ui-size="13"></span> 一键保活所有账号</button>
         </div>
@@ -805,7 +805,7 @@ t = requests.post(<span class="s">"BASE/v1/videos"</span>, json={<span class="s"
 </main>
 
 <footer style="max-width:1280px;margin:18px auto 32px;padding:12px 24px;text-align:center;color:var(--muted);font-size:12px;border-top:1px solid var(--line)">
-  <span>开源仓库：<a href="https://github.com/czg86389-hub/muse2api" target="_blank" style="color:var(--acc);text-decoration:none">GitHub · muse2api</a></span>
+  <span>开源仓库：<a href="https://github.com/czg86389-hub/muse2api" target="_blank" style="color:var(--accent);text-decoration:none">GitHub · muse2api</a></span>
 </footer>
 
 <toast-stack id="toastStack" duration="4000"></toast-stack>
