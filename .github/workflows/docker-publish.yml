@@ -1,0 +1,58 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+      - feat/auto-login
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python and run unit tests
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install runtime deps and run tests
+        run: |
+          pip install --no-cache-dir -r requirements.txt
+          python -m py_compile app.py auto_login.py credentials.py config.py store.py engine.py cdp.py proxy.py tetherpool.py mediabak.py idempotency.py updater.py generation_timing.py thumbnails.py
+          python -m unittest test_auto_login.py -v
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract short SHA
+        id: vars
+        run: echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/muse2api:latest
+            ghcr.io/${{ github.repository_owner }}/muse2api:${{ steps.vars.outputs.short_sha }}
+          build-args: |
+            BUILD_SHA=${{ steps.vars.outputs.short_sha }}
+            USE_CN_MIRROR=0
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -19,9 +19,10 @@ LABEL org.opencontainers.image.revision=$BUILD_SHA
 
 WORKDIR /app
 
-# 国内镜像源加速（腾讯轻量内网直连，部署机本地化修改；恢复官方源用 Dockerfile.bak-mirror）
-RUN sed -i 's|deb.debian.org|mirrors.cloud.tencent.com|g' /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true
-RUN pip config set global.index-url https://mirrors.cloud.tencent.com/pypi/simple
+# 镜像源切换：默认使用官方源（适配 GitHub CI），国内构建可传 --build-arg USE_CN_MIRROR=1
+ARG USE_CN_MIRROR=0
+RUN if [ "$USE_CN_MIRROR" = "1" ]; then sed -i 's|deb.debian.org|mirrors.cloud.tencent.com|g' /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true; fi
+RUN if [ "$USE_CN_MIRROR" = "1" ]; then pip config set global.index-url https://mirrors.cloud.tencent.com/pypi/simple; fi
 
 # 安装 Chromium、中文字体与核心依赖（上游 1.6.11 新增 ffmpeg：视频缩略图）
 RUN apt-get update && apt-get install -y --no-install-recommends \
