@@ -4,60 +4,80 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>muse2api · 账号池控制台</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>tailwind.config = { darkMode: 'class' };</script>
+<script type="module">
+  import '/ui/ThemeToggle.js';
+  import '/ui/StatusIndicator.js';
+  import '/ui/SpotlightGlareCard.js';
+  import '/ui/AnimatedCounter.js';
+  import '/ui/ToastStack.js';
+  import '/ui/EmptyState.js';
+  import '/ui/CodeBlock.js';
+  import '/ui/LiquidGlass.js';
+</script>
 <style>
   :root{
-    --bg:#0a0e17; --bg2:#0e1421; --panel:#121a2b; --panel2:#0f1626;
-    --line:#20293d; --line2:#2b3550; --text:#e7eaf3; --muted:#8590a8;
-    --accent:#4f8cff; --accent2:#2563eb; --ok:#34d399; --bad:#f87171;
-    --warn:#fbbf24; --purple:#a78bfa; --radius:12px;
+    --bg:#f5f3ec; --bg2:#efece2; --panel:#faf8f1; --panel2:#f3f0e6;
+    --line:#d6d2c2; --line2:#c5c0ae; --text:#22262d; --muted:#686d76;
+    --accent:#4f46e5; --accent2:#4338ca; --ok:#059669; --bad:#dc2626;
+    --warn:#d97706; --purple:#6366f1; --radius:12px;
+    --code-bg:#f0ede3; --code-fg:#1f2937;
+  }
+  html.dark{
+    --bg:#0d1017; --bg2:#131722; --panel:#1a1d24; --panel2:#151820;
+    --line:#2b3038; --line2:#383e49; --text:#e9e6db; --muted:#8f96a3;
+    --accent:#6366f1; --accent2:#4f46e5; --ok:#10b981; --bad:#ef4444;
+    --warn:#f59e0b; --purple:#818cf8;
+    --code-bg:#11141b; --code-fg:#d6dce8;
   }
   *{box-sizing:border-box}
   body{
-    margin:0;background:radial-gradient(1200px 600px at 15% -10%,#152140 0%,var(--bg) 55%) no-repeat,var(--bg);
-    color:var(--text);font:14px/1.6 "Segoe UI",system-ui,-apple-system,"Microsoft YaHei",sans-serif;
-    min-height:100vh;
+    margin:0;background:var(--bg);
+    color:var(--text);font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    min-height:100vh;transition:background-color .2s,color .2s;
   }
   a{color:var(--accent);text-decoration:none}
-  code,kbd,pre{font-family:ui-monospace,SFMono-Regular,Consolas,"Cascadia Mono",monospace}
+  code,kbd,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
 
   /* ---------- 顶栏 ---------- */
   header{
-    position:sticky;top:0;z-index:20;backdrop-filter:blur(14px);
-    background:rgba(10,14,23,.82);border-bottom:1px solid var(--line);
+    position:sticky;top:0;z-index:30;backdrop-filter:blur(12px);
+    background:color-mix(in srgb,var(--panel) 88%,transparent);border-bottom:1px solid var(--line);
   }
-  .hwrap{width:100%;max-width:none;margin:0;padding:14px clamp(12px,1.2vw,24px);display:flex;align-items:center;gap:16px;flex-wrap:wrap}
-  .logo{min-width:0;max-width:100%;flex-wrap:wrap;display:flex;align-items:center;gap:10px;font-weight:650;font-size:17px;letter-spacing:.2px}
-  .logo .dot{width:10px;height:10px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--purple));box-shadow:0 0 14px rgba(79,140,255,.8)}
+  .hwrap{width:100%;max-width:1440px;margin:0 auto;padding:12px clamp(14px,2vw,24px);display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  .logo{min-width:0;max-width:100%;flex-wrap:wrap;display:flex;align-items:center;gap:10px;font-weight:700;font-size:16px;letter-spacing:-.01em}
+  .logo .brand-mark{width:30px;height:30px;border-radius:9px;background:color-mix(in srgb,var(--accent) 12%,transparent);border:1px solid color-mix(in srgb,var(--accent) 25%,transparent);color:var(--accent);display:inline-flex;align-items:center;justify-content:center}
   .logo small{color:var(--muted);font-weight:400;font-size:12px;margin-left:2px}
   .pills{min-width:0;max-width:100%;display:flex;gap:8px;flex-wrap:wrap;margin-left:auto;align-items:center}
   .pill{
-    display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:5px 11px;border-radius:999px;
-    background:var(--panel);border:1px solid var(--line);color:var(--muted);white-space:nowrap
+    display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:4px 10px;border-radius:999px;
+    background:var(--bg2);border:1px solid var(--line);color:var(--muted);white-space:nowrap
   }
   .pill b{color:var(--text);font-weight:600}
-  .pill .led{width:7px;height:7px;border-radius:50%;background:var(--muted)}
-  .pill.on .led{background:var(--ok);box-shadow:0 0 8px var(--ok)}
-  .pill.off .led{background:var(--bad);box-shadow:0 0 8px var(--bad)}
+  .pill .led{width:6px;height:6px;border-radius:50%;background:var(--muted)}
+  .pill.on .led{background:var(--ok)}
+  .pill.off .led{background:var(--bad)}
 
-  .keybox{min-width:0;max-width:100%;display:flex;align-items:center;gap:6px;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:4px 6px 4px 11px}
-  .keybox input{min-width:0;flex:1 1 120px;background:transparent;border:0;color:var(--text);outline:none;width:210px;font-size:12.5px;font-family:ui-monospace,monospace}
-  .keybox button{padding:5px 10px;font-size:12px}
+  .keybox{min-width:0;max-width:100%;display:flex;align-items:center;gap:6px;background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:3px 6px 3px 10px}
+  .keybox input{min-width:0;flex:1 1 120px;background:transparent;border:0;color:var(--text);outline:none;width:190px;font-size:12px;font-family:ui-monospace,monospace}
+  .keybox button{padding:4px 10px;font-size:12px}
 
   /* ---------- 布局 ---------- */
-  main{width:100%;max-width:none;margin:0;padding:clamp(12px,1.2vw,24px)}
-  nav.tabs{display:flex;gap:6px;margin-bottom:20px;flex-wrap:wrap;border-bottom:1px solid var(--line);padding-bottom:0}
+  main{width:100%;max-width:1440px;margin:0 auto;padding:clamp(14px,2vw,24px)}
+  nav.tabs{display:flex;gap:4px;margin-bottom:20px;flex-wrap:wrap;border-bottom:1px solid var(--line);padding-bottom:0}
   nav.tabs button{
     background:transparent;border:0;border-bottom:2px solid transparent;color:var(--muted);
-    padding:10px 16px;font-size:14px;cursor:pointer;border-radius:8px 8px 0 0;transition:.15s
+    padding:9px 15px;font-size:13.5px;font-weight:500;cursor:pointer;border-radius:8px 8px 0 0;transition:.15s
   }
-  nav.tabs button:hover{color:var(--text);background:rgba(255,255,255,.03)}
+  nav.tabs button:hover{color:var(--text);background:color-mix(in srgb,var(--text) 4%,transparent)}
   nav.tabs button.active{color:var(--text);border-bottom-color:var(--accent);font-weight:600}
-  .tab{display:none}.tab.active{display:block;animation:fade .18s ease}
-  @keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+  .tab{display:none}.tab.active{display:block;animation:fade .16s ease}
+  @keyframes fade{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
 
   /* ---------- 卡片 ---------- */
-  .card{background:linear-gradient(180deg,var(--panel) 0%,var(--panel2) 100%);border:1px solid var(--line);border-radius:var(--radius);padding:18px;margin-bottom:16px}
-  .card>h3{margin:0 0 4px;font-size:14.5px;display:flex;align-items:center;gap:8px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:18px;margin-bottom:16px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+  .card>h3{margin:0 0 4px;font-size:14.5px;font-weight:600;display:flex;align-items:center;gap:8px}
   .card>h3 .tag{font-size:11px;font-weight:500;color:var(--muted);background:var(--bg2);border:1px solid var(--line);border-radius:6px;padding:1px 7px}
   .hint{color:var(--muted);font-size:12.5px;margin:2px 0 12px}
   .row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
@@ -66,16 +86,16 @@
   .copyline input{flex:1;font-family:ui-monospace,monospace;font-size:12.5px}
 
   /* ---------- 分步引导 ---------- */
-  .stepbox{display:flex;gap:13px;align-items:flex-start;padding:15px 0;border-bottom:1px solid rgba(32,41,61,.6)}
+  .stepbox{display:flex;gap:13px;align-items:flex-start;padding:15px 0;border-bottom:1px solid var(--line)}
   .stepbox:last-child{border-bottom:0;padding-bottom:0}
   .stepbox:first-of-type{padding-top:4px}
-  .stepno{flex:0 0 26px;width:26px;height:26px;border-radius:50%;background:var(--accent2);color:#fff;
-    display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:650;margin-top:1px}
-  .btnlike{display:inline-flex;align-items:center;gap:6px;background:var(--accent2);color:#fff;
-    border-radius:9px;padding:9px 16px;font-size:13px;text-decoration:none;transition:.15s}
-  .btnlike:hover{background:#3b82f6;color:#fff}
+  .stepno{flex:0 0 26px;width:26px;height:26px;border-radius:50%;background:var(--accent);color:#fff;
+    display:flex;align-items:center;justify-content:center;font-size:12.5px;font-weight:650;margin-top:1px}
+  .btnlike{display:inline-flex;align-items:center;gap:6px;background:var(--accent);color:#fff;
+    border-radius:9px;padding:8px 14px;font-size:13px;font-weight:500;text-decoration:none;transition:.15s;border:0;cursor:pointer}
+  .btnlike:hover{background:var(--accent2);color:#fff}
   .btnlike.ghostlike{background:transparent;border:1px solid var(--line);color:var(--text)}
-  .btnlike.ghostlike:hover{background:rgba(255,255,255,.05);border-color:#37415a;color:var(--text)}
+  .btnlike.ghostlike:hover{background:var(--bg2);border-color:var(--line2);color:var(--text)}
   .olsteps{margin:8px 0 0;padding-left:0;list-style:none;counter-reset:ols}
   .olsteps>li{position:relative;padding:5px 0 5px 30px;font-size:12.5px;color:var(--muted);line-height:1.8;counter-increment:ols}
   .olsteps>li::before{content:counter(ols);position:absolute;left:0;top:6px;width:19px;height:19px;border-radius:50%;
@@ -87,57 +107,58 @@
     border-radius:5px;padding:1px 7px;font-size:11.5px;color:var(--text);line-height:1.6;white-space:nowrap}
 
   /* ---------- 统计 ---------- */
-  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:16px}
-  .stat{background:linear-gradient(180deg,var(--panel) 0%,var(--panel2) 100%);border:1px solid var(--line);border-radius:var(--radius);padding:15px 17px}
-  .stat .k{color:var(--muted);font-size:12px;margin-bottom:4px}
-  .stat .v{font-size:25px;font-weight:650;letter-spacing:.4px}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:16px}
+  .stat{padding:15px 17px}
+  .stat .k{color:var(--muted);font-size:12px;margin-bottom:4px;display:flex;align-items:center;justify-content:space-between}
+  .stat .v{font-size:24px;font-weight:700;letter-spacing:-.02em;font-family:ui-monospace,monospace}
   .stat.g .v{color:var(--ok)}.stat.r .v{color:var(--bad)}.stat.y .v{color:var(--warn)}.stat.b .v{color:var(--accent)}
 
   /* ---------- 表单 ---------- */
   label{display:block;font-size:12.5px;color:var(--muted);margin-bottom:5px}
   input[type=text],input[type=number],.proxy-dialog input[type=password],textarea,select{
     width:100%;background:var(--bg2);color:var(--text);border:1px solid var(--line);border-radius:9px;
-    padding:9px 12px;font-size:13px;outline:none;transition:.15s;font-family:inherit
+    padding:8px 12px;font-size:13px;outline:none;transition:.15s;font-family:inherit
   }
   textarea{font-family:ui-monospace,monospace;resize:vertical;line-height:1.55}
-  input:focus,textarea:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,140,255,.13)}
+  input:focus,textarea:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 16%,transparent)}
   dialog.proxy-dialog{width:min(480px,calc(100% - 32px));max-height:calc(100dvh - 32px);overflow:auto;
-    background:var(--panel);color:var(--text);border:1px solid var(--line2);border-radius:var(--radius);padding:24px}
-  dialog.proxy-dialog::backdrop{background:rgba(0,0,0,.65)}
-  .proxy-dialog h2{margin:0 0 8px;font-size:18px}
-  .proxy-dialog label{margin-top:16px}
-  .proxy-dialog .proxy-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;margin-top:24px}
+    background:var(--panel);color:var(--text);border:1px solid var(--line2);border-radius:14px;padding:24px;box-shadow:0 20px 50px rgba(0,0,0,.25)}
+  dialog.proxy-dialog::backdrop{background:rgba(0,0,0,.55);backdrop-filter:blur(4px)}
+  .proxy-dialog h2{margin:0 0 8px;font-size:17px;font-weight:700}
+  .proxy-dialog label{margin-top:14px}
+  .proxy-dialog .proxy-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;margin-top:22px}
   .proxy-summary{max-width:180px;font-size:11px;color:var(--muted);margin-top:4px}
   #proxyError{color:var(--bad);margin-top:12px;font-size:13px}
   button{
-    background:var(--accent2);color:#fff;border:0;border-radius:9px;padding:9px 16px;
-    font-size:13px;cursor:pointer;transition:.15s;font-family:inherit;white-space:nowrap
+    background:var(--accent);color:#fff;border:0;border-radius:9px;padding:8px 14px;
+    font-size:13px;font-weight:500;cursor:pointer;transition:.15s;font-family:inherit;white-space:nowrap;
+    display:inline-flex;align-items:center;justify-content:center;gap:5px
   }
-  button:hover{background:#3b82f6}
+  button:hover{background:var(--accent2)}
   button:active{transform:translateY(1px)}
   button:disabled{opacity:.45;cursor:not-allowed}
-  button.ghost{background:transparent;border:1px solid var(--line);color:var(--text)}
-  button.ghost:hover{background:rgba(255,255,255,.05);border-color:#37415a}
-  button.danger{background:transparent;border:1px solid rgba(248,113,113,.4);color:var(--bad)}
-  button.danger:hover{background:rgba(248,113,113,.12)}
-  button.mini{padding:4px 10px;font-size:12px;border-radius:7px}
-  button.primary-lg{padding:11px 24px;font-size:13.5px}
+  button.ghost,button.secondary{background:transparent;border:1px solid var(--line);color:var(--text)}
+  button.ghost:hover,button.secondary:hover{background:var(--bg2);border-color:var(--line2)}
+  button.danger{background:transparent;border:1px solid color-mix(in srgb,var(--bad) 45%,transparent);color:var(--bad)}
+  button.danger:hover{background:color-mix(in srgb,var(--bad) 10%,transparent)}
+  button.mini{padding:4px 9px;font-size:12px;border-radius:7px}
+  button.primary-lg{padding:10px 22px;font-size:13.5px;font-weight:600}
 
   /* ---------- 表格 ---------- */
-  .tblwrap{overflow-x:auto;border:1px solid var(--line);border-radius:var(--radius)}
+  .tblwrap{overflow-x:auto;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel)}
   table{width:100%;border-collapse:collapse;font-size:13px}
-  th{background:var(--bg2);color:var(--muted);font-weight:500;font-size:12px;text-align:left;padding:10px 13px;white-space:nowrap;border-bottom:1px solid var(--line)}
-  td{padding:11px 13px;border-bottom:1px solid rgba(32,41,61,.6);vertical-align:middle}
+  th{background:var(--bg2);color:var(--muted);font-weight:600;font-size:12px;text-align:left;padding:10px 13px;white-space:nowrap;border-bottom:1px solid var(--line)}
+  td{padding:11px 13px;border-bottom:1px solid var(--line);vertical-align:middle}
   tbody tr:last-child td{border-bottom:0}
-  tbody tr:hover{background:rgba(79,140,255,.045)}
+  tbody tr:hover{background:color-mix(in srgb,var(--accent) 4%,transparent)}
   .mono{font-family:ui-monospace,monospace;font-size:12px;color:var(--muted)}
   .ellip{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;vertical-align:middle}
-  .badge{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;padding:3px 9px;border-radius:999px;border:1px solid;white-space:nowrap}
-  .badge.ok{color:var(--ok);border-color:rgba(52,211,153,.35);background:rgba(52,211,153,.1)}
-  .badge.bad{color:var(--bad);border-color:rgba(248,113,113,.35);background:rgba(248,113,113,.1)}
-  .badge.warn{color:var(--warn);border-color:rgba(251,191,36,.35);background:rgba(251,191,36,.1)}
+  .badge{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;font-weight:500;padding:2px 8px;border-radius:999px;border:1px solid;white-space:nowrap}
+  .badge.ok{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 35%,transparent);background:color-mix(in srgb,var(--ok) 10%,transparent)}
+  .badge.bad{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 35%,transparent);background:color-mix(in srgb,var(--bad) 10%,transparent)}
+  .badge.warn{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 35%,transparent);background:color-mix(in srgb,var(--warn) 10%,transparent)}
   .badge.mute{color:var(--muted);border-color:var(--line);background:var(--bg2)}
-  .badge.info{color:var(--accent);border-color:rgba(79,140,255,.35);background:rgba(79,140,255,.1)}
+  .badge.info{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 35%,transparent);background:color-mix(in srgb,var(--accent) 10%,transparent)}
   .acts{display:flex;gap:6px;flex-wrap:wrap}
   #poolBody td.ellip{display:table-cell;white-space:normal;overflow-wrap:anywhere}
   #poolBody .proxy-summary{display:block;max-width:100%}
@@ -145,20 +166,20 @@
 
   /* ---------- 媒体库 ---------- */
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:14px}
-  .tile{position:relative;background:var(--bg2);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;transition:.18s}
-  .tile:hover{border-color:#37415a;transform:translateY(-2px)}
+  .tile{position:relative;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;transition:.18s}
+  .tile:hover{border-color:var(--line2);transform:translateY(-2px)}
   .tile.selected{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
-  .tile .check-tag{position:absolute;top:8px;left:8px;z-index:3;display:flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:6px;background:rgba(15,23,42,.82);backdrop-filter:blur(4px);border:1px solid var(--line);cursor:pointer;transition:.15s}
-  .tile .check-tag:hover{border-color:var(--accent);background:rgba(15,23,42,.95)}
+  .tile .check-tag{position:absolute;top:8px;left:8px;z-index:3;display:flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:6px;background:rgba(15,23,42,.75);backdrop-filter:blur(4px);border:1px solid rgba(255,255,255,.2);cursor:pointer;transition:.15s}
+  .tile .check-tag:hover{border-color:var(--accent)}
   .tile .check-tag input{width:14px;height:14px;margin:0;cursor:pointer;accent-color:var(--accent)}
-  .tile .thumb{height:150px;background:#060911;display:flex;align-items:center;justify-content:center;overflow:hidden;position:relative}
+  .tile .thumb{height:150px;background:#0a0c10;display:flex;align-items:center;justify-content:center;overflow:hidden;position:relative}
   .tile .thumb img,.tile .thumb video{width:100%;height:100%;object-fit:contain;display:block}
   .tile button.thumb{width:100%;padding:0;border:0;border-radius:0;cursor:pointer;color:#fff}
   .tile .thumb img[hidden]{display:none}
-  .tile .play-icon{position:absolute;display:grid;place-items:center;width:44px;height:44px;border-radius:50%;background:rgba(0,0,0,.65);font-size:21px;pointer-events:none}
+  .tile .play-icon{position:absolute;display:grid;place-items:center;width:42px;height:42px;border-radius:50%;background:rgba(0,0,0,.6);font-size:18px;pointer-events:none}
   .tile button.thumb:focus-visible{outline:2px solid var(--accent);outline-offset:-3px}
-  dialog.media-dialog{width:min(960px,calc(100% - 32px));max-height:calc(100dvh - 32px);padding:16px;border:1px solid var(--line);border-radius:var(--radius);background:var(--bg2);color:var(--text)}
-  dialog.media-dialog::backdrop{background:rgba(0,0,0,.75)}
+  dialog.media-dialog{width:min(960px,calc(100% - 32px));max-height:calc(100dvh - 32px);padding:16px;border:1px solid var(--line);border-radius:14px;background:var(--panel);color:var(--text)}
+  dialog.media-dialog::backdrop{background:rgba(0,0,0,.7)}
   .media-dialog header{display:flex;align-items:center;gap:16px;margin-bottom:12px}
   .media-dialog h2{margin:0;flex:1;min-width:0;font-size:15px;overflow-wrap:anywhere}
   .media-dialog video{display:block;width:100%;max-height:75dvh;background:#000}
@@ -169,42 +190,36 @@
   /* ---------- 结果预览 ---------- */
   .result{margin-top:14px;padding:14px;background:var(--bg2);border:1px dashed var(--line);border-radius:var(--radius);display:none}
   .result.show{display:block}
-  .result img,.result video{max-width:100%;max-height:420px;border-radius:9px;display:block;margin-top:10px;background:#060911}
-  pre.out{background:#060911;border:1px solid var(--line);border-radius:9px;padding:12px;overflow:auto;max-height:280px;font-size:12px;color:#9fe8c0;margin:10px 0 0;white-space:pre-wrap;word-break:break-all}
-
-  /* ---------- 提示条 ---------- */
-  #toasts{position:fixed;right:20px;bottom:20px;z-index:99;display:flex;flex-direction:column;gap:9px;align-items:flex-end}
-  .toast{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:10px;padding:11px 15px;font-size:13px;max-width:380px;box-shadow:0 12px 34px rgba(0,0,0,.55);animation:slide .2s ease}
-  .toast.ok{border-left-color:var(--ok)}.toast.bad{border-left-color:var(--bad)}.toast.warn{border-left-color:var(--warn)}
-  @keyframes slide{from{opacity:0;transform:translateX(18px)}to{opacity:1;transform:none}}
+  .result img,.result video{max-width:100%;max-height:420px;border-radius:9px;display:block;margin-top:10px;background:#0a0c10}
+  pre.out{background:var(--code-bg);border:1px solid var(--line);border-radius:9px;padding:12px;overflow:auto;max-height:280px;font-size:12px;color:var(--code-fg);margin:10px 0 0;white-space:pre-wrap;word-break:break-all}
 
   /* ---------- 文档 ---------- */
-  .doc h4{margin:20px 0 8px;font-size:13.5px;color:var(--text)}
+  .doc h4{margin:20px 0 8px;font-size:13.5px;font-weight:600;color:var(--text)}
   .doc h4:first-child{margin-top:0}
-  pre.code{background:#060911;border:1px solid var(--line);border-radius:9px;padding:14px;overflow:auto;font-size:12.5px;line-height:1.65;color:#cfe3ff;position:relative}
+  pre.code{background:var(--code-bg);border:1px solid var(--line);border-radius:10px;padding:14px;overflow:auto;font-size:12.5px;line-height:1.65;color:var(--code-fg);position:relative}
   pre.code .cp{position:absolute;top:8px;right:8px;font-size:11px;padding:3px 9px;background:var(--panel);border:1px solid var(--line);color:var(--muted);border-radius:6px;cursor:pointer}
-  pre.code .cp:hover{color:var(--text)}
-  .k{color:var(--purple)}.s{color:#7ee2a8}.c{color:#5b6478}
-  .spin{display:inline-block;width:13px;height:13px;border:2px solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px;margin-right:6px}
+  pre.code .cp:hover{color:var(--text);border-color:var(--line2)}
+  .k{color:var(--accent)}.s{color:var(--ok)}.c{color:var(--muted)}
+  .spin{display:inline-block;width:13px;height:13px;border:2px solid color-mix(in srgb,var(--text) 25%,transparent);border-top-color:currentColor;border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px;margin-right:6px}
   @keyframes sp{to{transform:rotate(360deg)}}
   .live{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;color:var(--muted)}
   .live .led{width:6px;height:6px;border-radius:50%;background:var(--ok);animation:bl 1.6s infinite}
   @keyframes bl{0%,100%{opacity:1}50%{opacity:.25}}
 
-  /* ---------- 未登录提示条 ---------- */
-  .banner{display:none;align-items:flex-start;gap:13px;background:linear-gradient(90deg,rgba(251,191,36,.14),rgba(251,191,36,.03));
-    border:1px solid rgba(251,191,36,.42);border-radius:var(--radius);padding:15px 18px;margin-bottom:16px;font-size:13.5px;line-height:1.75}
+  /* ---------- 提示横幅 ---------- */
+  .banner{display:none;align-items:flex-start;gap:12px;background:color-mix(in srgb,var(--warn) 8%,var(--panel));
+    border:1px solid color-mix(in srgb,var(--warn) 35%,transparent);border-radius:var(--radius);padding:14px 18px;margin-bottom:16px;font-size:13px;line-height:1.7}
   .banner.show{display:flex}
-  .banner .ic{font-size:20px;line-height:1.2}
+  .banner .ic{display:inline-flex;align-items:center;justify-content:center;color:var(--warn);margin-top:2px}
   .banner b{color:var(--warn)}
-  .banner code{background:rgba(0,0,0,.35);padding:2px 7px;border-radius:5px;color:#7dd3fc;font-size:12.5px}
-  .keybox.miss{border-color:rgba(251,191,36,.75);box-shadow:0 0 0 3px rgba(251,191,36,.12);animation:pulse 1.8s infinite}
-  @keyframes pulse{0%,100%{box-shadow:0 0 0 3px rgba(251,191,36,.12)}50%{box-shadow:0 0 0 5px rgba(251,191,36,.05)}}
-  .keybox .lbl{font-size:11.5px;color:var(--muted);padding-left:4px;white-space:nowrap}
+  .banner code{background:var(--bg2);border:1px solid var(--line);padding:1px 6px;border-radius:5px;color:var(--accent);font-size:12px}
+  .warnbar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;border-radius:var(--radius);background:color-mix(in srgb,var(--warn) 8%,var(--panel));border:1px solid color-mix(in srgb,var(--warn) 35%,transparent);margin-bottom:16px;font-size:13px}
+  .keybox.miss{border-color:var(--warn);box-shadow:0 0 0 3px color-mix(in srgb,var(--warn) 14%,transparent)}
+  .keybox .lbl{font-size:11.5px;color:var(--muted);padding-left:2px;white-space:nowrap}
   .keybox.ok .lbl{color:var(--ok)}
   .keybox.miss .lbl{color:var(--warn)}
-  .langsel{width:auto;flex:0 0 auto;background:var(--bg2);color:var(--text);border:1px solid var(--line2);border-radius:999px;padding:4px 10px;font-size:12px;cursor:pointer}
-  .updpill-alert{border-color:rgba(251,191,36,.8)!important;background:rgba(251,191,36,.15)!important;color:var(--warn)!important;animation:pulse 1.6s infinite}
+  .langsel{width:auto;flex:0 0 auto;background:var(--bg2);color:var(--text);border:1px solid var(--line);border-radius:999px;padding:4px 10px;font-size:12px;cursor:pointer}
+  .updpill-alert{border-color:var(--warn)!important;background:color-mix(in srgb,var(--warn) 12%,transparent)!important;color:var(--warn)!important}
 </style>
 </head>
 <body>
@@ -212,13 +227,16 @@
 <header>
   <div class="hwrap">
     <div class="logo">
-      <span class="dot"></span>muse2api <small>Muse 网页额度 · 反代 API</small>
-      <a href="https://github.com/czg86389-hub/muse2api" target="_blank" id="repoHomeLink" class="pill" style="margin-left:10px;text-decoration:none;color:var(--text);border-color:var(--line2);cursor:pointer" title="打开 GitHub 开源仓库 (https://github.com/czg86389-hub/muse2api)">
-        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" style="vertical-align:-2px"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg>
-        <b>GitHub 仓库</b>
+      <span class="brand-mark" data-ui-icon="sparkles" data-ui-size="16"></span>
+      <span>muse2api</span>
+      <small>Muse 网页额度 · 反代控制台</small>
+      <a href="https://github.com/czg86389-hub/muse2api" target="_blank" id="repoHomeLink" class="pill" style="margin-left:6px;text-decoration:none;color:var(--text);cursor:pointer" title="打开 GitHub 开源仓库">
+        <span data-ui-icon="git-branch" data-ui-size="13"></span>
+        <b>GitHub</b>
       </a>
-      <button class="ghost mini" onclick="toggleRepoPanel()" id="btnRepoTop" style="display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:4px 11px;font-size:12px" title="查看官方仓库最新版本状态与更新通知">
-        📦 <span id="repoTopTxt">版本检测</span>
+      <button class="ghost mini" onclick="toggleRepoPanel()" id="btnRepoTop" style="border-radius:999px;padding:4px 10px;font-size:12px" title="查看仓库最新版本状态与更新通知">
+        <span data-ui-icon="refresh" data-ui-size="12"></span>
+        <span id="repoTopTxt">版本检测</span>
       </button>
     </div>
     <div class="pills">
@@ -226,6 +244,7 @@
       <span class="pill" id="pAcc"><span class="led"></span>账号 <b>—</b></span>
       <span class="pill" id="pBr"><span class="led"></span>浏览器 <b>—</b></span>
       <span class="live" id="live"><span class="led"></span>自动刷新</span>
+      <theme-toggle storage-key="muse-theme"></theme-toggle>
       <span class="keybox" id="keyBox">
         <span class="lbl" id="keyLbl">API Key</span>
         <input id="key" type="password" placeholder="粘贴 m2a_ 开头的密钥" autocomplete="off">
@@ -243,15 +262,15 @@
   <!-- 实时新版本更新通知横幅（当官方仓库有新提交/新版本时自动向所有已部署用户弹出） -->
   <div class="banner" id="updateBanner" style="border-color:rgba(79,140,255,.65);background:linear-gradient(90deg,rgba(79,140,255,.16),rgba(167,139,250,.05));align-items:center;justify-content:space-between;flex-wrap:wrap">
     <div style="display:flex;gap:12px;align-items:flex-start;flex:1;min-width:260px">
-      <span class="ic">🔔</span>
+      <span class="ic" data-ui-icon="sparkles" data-ui-size="18"></span>
       <div>
-        <b style="color:#60a5fa">检测到 muse2api 官方仓库发布了新版本更新！</b>
+        <b style="color:var(--accent)">检测到 muse2api 官方仓库发布了新版本更新！</b>
         <span id="updBannerVer" class="badge info" style="margin-left:8px">新版本</span><br>
         <span id="updBannerMsg" style="color:var(--muted);font-size:13px">官方仓库已有新功能或性能优化提交，点击右侧按钮即可一键在线升级（自动保留本地 .env 密钥与账号池数据）。</span>
       </div>
     </div>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <button onclick="upgradeNow()" id="btnBannerUpgrade">⚡ 一键在线升级并重启</button>
+      <button onclick="upgradeNow()" id="btnBannerUpgrade"><span data-ui-icon="zap" data-ui-size="14"></span> 一键在线升级并重启</button>
       <button class="ghost mini" onclick="toggleRepoPanel()">查看更新内容</button>
       <button class="ghost mini" onclick="dismissUpdateBanner()">暂不提醒</button>
     </div>
@@ -268,14 +287,14 @@
     <div class="hint" id="repoStatusDesc" data-i18n="repo-status-desc">正在实时对比本地版本与 GitHub 官方仓库最新版本…（在线升级自动保留 <code>.env</code> 密钥与 <code>data/</code> 账号池及媒体数据）</div>
     <div id="repoCommitsBox" style="margin-top:10px;background:var(--bg2);border:1px solid var(--line);border-radius:9px;padding:10px 14px;font-size:12.5px"></div>
     <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-      <button onclick="upgradeNow()" id="btnRepoPull">⚡ 一键从 GitHub 在线更新并重启</button>
-      <button class="ghost" onclick="loadRepoStatus(true)">🔍 立即重新检测更新</button>
+      <button onclick="upgradeNow()" id="btnRepoPull"><span data-ui-icon="zap" data-ui-size="14"></span> 一键从 GitHub 在线更新并重启</button>
+      <button class="ghost" onclick="loadRepoStatus(true)"><span data-ui-icon="search" data-ui-size="14"></span> 立即重新检测更新</button>
       <a id="repoCommitsLink" href="https://github.com/czg86389-hub/muse2api/commits/main" target="_blank" class="btnlike ghostlike" style="padding:7px 13px;font-size:12.5px">查看 GitHub 完整提交记录 ↗</a>
     </div>
   </div>
 
   <div class="banner" id="authBanner">
-    <span class="ic">🔑</span>
+    <span class="ic" data-ui-icon="lock" data-ui-size="18"></span>
     <div data-i18n="auth-banner">
       <b>需要先填入 API Key，页面才能读到数据</b><br>
       <span style="color:var(--muted)">
@@ -331,11 +350,11 @@
     </div>
 
     <div class="stats">
-      <div class="stat b"><div class="k">账号总数</div><div class="v" id="sTotal">0</div></div>
-      <div class="stat g"><div class="k">可用</div><div class="v" id="sOk">0</div></div>
-      <div class="stat r"><div class="k">异常</div><div class="v" id="sBad">0</div></div>
-      <div class="stat y"><div class="k">已禁用</div><div class="v" id="sDis">0</div></div>
-      <div class="stat"><div class="k">媒体文件</div><div class="v" id="sMedia">0</div></div>
+      <spotlight-glare-card glare-opacity="0.22" class="stat b"><div class="k"><span>账号总数</span><span data-ui-icon="user" data-ui-size="14"></span></div><div class="v" id="sTotal">0</div></spotlight-glare-card>
+      <spotlight-glare-card glare-opacity="0.22" class="stat g"><div class="k"><span>可用</span><span data-ui-icon="check-circle" data-ui-size="14"></span></div><div class="v" id="sOk">0</div></spotlight-glare-card>
+      <spotlight-glare-card glare-opacity="0.22" class="stat r"><div class="k"><span>异常</span><span data-ui-icon="alert-triangle" data-ui-size="14"></span></div><div class="v" id="sBad">0</div></spotlight-glare-card>
+      <spotlight-glare-card glare-opacity="0.22" class="stat y"><div class="k"><span>已禁用</span><span data-ui-icon="minus" data-ui-size="14"></span></div><div class="v" id="sDis">0</div></spotlight-glare-card>
+      <spotlight-glare-card glare-opacity="0.22" class="stat"><div class="k"><span>媒体文件</span><span data-ui-icon="image" data-ui-size="14"></span></div><div class="v" id="sMedia">0</div></spotlight-glare-card>
     </div>
 
     <div class="card" id="generationQueuePanel">
@@ -379,7 +398,7 @@
         <div style="display:flex;gap:8px">
           <a href="/status" id="statusBoardLink" class="secondary" style="font-size:12px;padding:6px 14px;text-decoration:none;display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:8px;color:var(--fg)">状态与额度看板</a>
           <button class="secondary" onclick="openAuthProfile(null)" style="font-size:12px;padding:6px 14px">+ 凭据登录添加</button>
-          <button class="secondary" id="btnKeepaliveAll" onclick="keepaliveAll()" style="font-size:12px;padding:6px 14px">⚡ 一键保活所有账号</button>
+          <button class="secondary" id="btnKeepaliveAll" onclick="keepaliveAll()" style="font-size:12px;padding:6px 14px"><span data-ui-icon="zap" data-ui-size="13"></span> 一键保活所有账号</button>
         </div>
       </div>
       <div class="hint" data-i18n="keepalive-hint">系统已开启<b>后台每 15 分钟静默保活</b>（近 6h 内已保活且会话充足的账号自动跳过）与<b>多账号公平轮转（LRU）</b>；「测试」会真实打开 muse.ai 验证会话。</div>
@@ -515,7 +534,7 @@
         </div>
         <div style="flex:2">
           <label>&nbsp;</label>
-          <button class="btnlike" onclick="genImportToken()" id="genTokBtn" data-i18n="gen-token-btn">🔐 生成一次性导入令牌</button>
+          <button class="btnlike" onclick="genImportToken()" id="genTokBtn" data-i18n="gen-token-btn"><span data-ui-icon="lock" data-ui-size="14"></span> 生成一次性导入令牌</button>
         </div>
       </div>
       <div style="margin-top:10px">
@@ -526,7 +545,7 @@
         <div style="flex:2">
           <label data-i18n="rl-url-label">③ 或远程浏览器导号：生成链接，对方打开直接在服务器浏览器里登录</label>
           <div class="copyline">
-            <button class="btnlike" onclick="genLoginUrl()" id="genLoginUrlBtn">🖥 生成远程登录链接</button>
+            <button class="btnlike" onclick="genLoginUrl()" id="genLoginUrlBtn"><span data-ui-icon="monitor" data-ui-size="14"></span> 生成远程登录链接</button>
           </div>
         </div>
       </div>
@@ -789,7 +808,7 @@ t = requests.post(<span class="s">"BASE/v1/videos"</span>, json={<span class="s"
   <span>开源仓库：<a href="https://github.com/czg86389-hub/muse2api" target="_blank" style="color:var(--acc);text-decoration:none">GitHub · muse2api</a></span>
 </footer>
 
-<div id="toasts"></div>
+<toast-stack id="toastStack" duration="4000"></toast-stack>
 
 <dialog id="mediaDialog" class="media-dialog" aria-labelledby="mediaPreviewTitle">
   <header><h2 id="mediaPreviewTitle" data-no-i18n></h2><button class="btn" type="button" onclick="closeMediaPreview()">关闭预览</button></header>
@@ -1541,12 +1560,10 @@ function saveKey(){
 }
 
 function toast(msg, kind){
-  const d = document.createElement('div');
-  d.className = 'toast ' + (kind || '');
-  d.textContent = msg;
-  $('toasts').appendChild(d);
-  setTimeout(() => { d.style.opacity = '0'; d.style.transition = '.3s'; }, 3600);
-  setTimeout(() => d.remove(), 4000);
+  const stack = $('toastStack');
+  if (!stack || typeof stack.push !== 'function') return;
+  const map = { ok: 'success', bad: 'error', warn: 'warning', info: 'info' };
+  stack.push(msg, map[kind] || 'info');
 }
 
 async function api(path, opts){
@@ -2671,6 +2688,11 @@ setInterval(() => {
   import uiIcon from '/ui/UiIcon.js';
   const sb = document.getElementById('statusBoardLink');
   if (sb) sb.insertAdjacentHTML('afterbegin', uiIcon('layers', { size: 14 }));
+  document.querySelectorAll('[data-ui-icon]').forEach((el) => {
+    const name = el.getAttribute('data-ui-icon');
+    const size = parseInt(el.getAttribute('data-ui-size') || '16', 10);
+    if (name) el.innerHTML = uiIcon(name, { size });
+  });
 </script>
 </body>
 </html>

@@ -4131,6 +4131,8 @@ _UI_ALLOWED_FILES = frozenset({
     "ToastStack.js",
     "EmptyState.js",
     "StreamingProgressBar.js",
+    "CodeBlock.js",
+    "LiquidGlass.js",
 })
 
 
